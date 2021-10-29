@@ -1,7 +1,6 @@
 package remotehttp
 
 import (
-	"log"
 	"os"
 	"strings"
 
@@ -11,6 +10,7 @@ import (
 	"github.com/giongto35/cloud-game/v2/pkg/emulator/libretro/core"
 	"github.com/giongto35/cloud-game/v2/pkg/emulator/libretro/manager"
 	"github.com/giongto35/cloud-game/v2/pkg/emulator/libretro/repo"
+	"github.com/giongto35/cloud-game/v2/pkg/logger"
 	"github.com/gofrs/flock"
 )
 
@@ -21,19 +21,21 @@ type Manager struct {
 	repo   repo.Repository
 	client downloader.Downloader
 	fmu    *flock.Flock
+	log    *logger.Logger
 }
 
-func NewRemoteHttpManager(conf emulator.LibretroConfig) Manager {
+func NewRemoteHttpManager(conf emulator.LibretroConfig, log *logger.Logger) Manager {
 	repoConf := conf.Cores.Repo.Main
 	// used for synchronization of multiple process
 	fileLock := conf.Cores.Repo.ExtLock
 	if fileLock == "" {
 		fileLock = os.TempDir() + string(os.PathSeparator) + "cloud_game.lock"
 	}
+	log.Debug().Msgf("Using .lock file: %v", fileLock)
 
 	arch, err := core.GetCoreExt()
 	if err != nil {
-		log.Printf("error: %v", err)
+		log.Error().Err(err).Msg("couldn't get Libretro core file extension")
 	}
 
 	return Manager{
@@ -44,6 +46,7 @@ func NewRemoteHttpManager(conf emulator.LibretroConfig) Manager {
 		repo:   repo.New(repoConf.Type, repoConf.Url, repoConf.Compression, "buildbot"),
 		client: downloader.NewDefaultDownloader(),
 		fmu:    flock.New(fileLock),
+		log:    log,
 	}
 }
 
@@ -59,7 +62,7 @@ func (m *Manager) Sync() error {
 
 	_, failed := m.download(download)
 	if len(failed) > 0 {
-		log.Printf("[core-dl] error: unable to download some cores, trying 2nd repository")
+		m.log.Warn().Msg("unable to download some cores, trying 2nd repository")
 		conf := m.Conf.Cores.Repo.Secondary
 		if conf.Type != "" {
 			if fallback := repo.New(conf.Type, conf.Url, conf.Compression, ""); fallback != nil {
@@ -87,7 +90,7 @@ func (m *Manager) setRepo(repo repo.Repository) {
 func (m *Manager) download(cores []string) (succeeded []string, failed []string) {
 	if len(cores) > 0 && m.repo != nil {
 		dir := m.Conf.GetCoresStorePath()
-		log.Printf("[core-dl] <<< download: %v", strings.Join(cores, ", "))
+		m.log.Info().Msgf("<<< downloading cores: %v", strings.Join(cores, ", "))
 		_, failed = m.client.Download(dir, m.getCoreUrls(cores, m.repo)...)
 	}
 	return
