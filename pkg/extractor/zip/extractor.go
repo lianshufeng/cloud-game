@@ -7,11 +7,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/giongto35/cloud-game/v2/pkg/logger"
 )
 
-type Extractor struct{}
+type Extractor struct {
+	log *logger.Logger
+}
 
-func New() Extractor { return Extractor{} }
+func New(log *logger.Logger) Extractor {
+	return Extractor{
+		log: log,
+	}
+}
 
 func (e Extractor) Extract(src string, dest string) (files []string, err error) {
 	r, err := zip.OpenReader(src)
