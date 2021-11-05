@@ -1,4 +1,4 @@
-// This package used for locking goroutines to
+// Package thread is used for locking goroutines to
 // the main OS thread.
 // See: https://github.com/golang/go/wiki/LockOSThread
 package thread
