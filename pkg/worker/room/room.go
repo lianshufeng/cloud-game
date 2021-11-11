@@ -220,9 +220,8 @@ func isGameOnLocal(path string) bool {
 }
 
 func (r *Room) AddConnectionToRoom(peerconnection *webrtc.WebRTC) {
-	peerconnection.AttachRoomID(r.ID)
+	peerconnection.SetRoom(r.ID)
 	r.rtcSessions = append(r.rtcSessions, peerconnection)
-
 	go r.startWebRTCSession(peerconnection)
 }
 
@@ -249,7 +248,7 @@ func (r *Room) startWebRTCSession(peerconnection *webrtc.WebRTC) {
 
 		if peerconnection.IsConnected() {
 			select {
-			case r.inputChannel <- nanoarch.InputEvent{RawState: input, PlayerIdx: peerconnection.PlayerIndex, ConnID: peerconnection.ID}:
+			case r.inputChannel <- nanoarch.InputEvent{RawState: input, PlayerIdx: peerconnection.PlayerIndex, ConnID: peerconnection.GetId()}:
 			default:
 			}
 		}
@@ -261,16 +260,16 @@ func (r *Room) startWebRTCSession(peerconnection *webrtc.WebRTC) {
 func (r *Room) RemoveSession(w *webrtc.WebRTC) {
 	// TODO: get list of r.rtcSessions in lock
 	for i, s := range r.rtcSessions {
-		if s.ID == w.ID {
+		if s.GetId() == w.GetId() {
 			r.rtcSessions = append(r.rtcSessions[:i], r.rtcSessions[i+1:]...)
 			s.RoomID = ""
-			r.log.Debug().Str("session", s.ID).Msg("Session has been removed")
+			r.log.Debug().Str("session", s.GetId()).Msg("Session has been removed")
 			break
 		}
 	}
 	// Detach input. Send end signal
 	select {
-	case r.inputChannel <- nanoarch.InputEvent{RawState: []byte{0xFF, 0xFF}, ConnID: w.ID}:
+	case r.inputChannel <- nanoarch.InputEvent{RawState: []byte{0xFF, 0xFF}, ConnID: w.GetId()}:
 	default:
 	}
 }
@@ -281,7 +280,7 @@ func (r *Room) IsPCInRoom(w *webrtc.WebRTC) bool {
 		return false
 	}
 	for _, s := range r.rtcSessions {
-		if s.ID == w.ID {
+		if s.GetId() == w.GetId() {
 			return true
 		}
 	}
