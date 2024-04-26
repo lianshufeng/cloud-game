@@ -55,6 +55,9 @@ var DefaultUpgrader = Upgrader{Upgrader: websocket.Upgrader{
 	WriteBufferSize:   2048,
 	WriteBufferPool:   &sync.Pool{},
 	EnableCompression: true,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }}
 
 func NewUpgrader(origin string) *Upgrader {
