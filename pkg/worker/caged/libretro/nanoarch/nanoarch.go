@@ -169,6 +169,8 @@ func (n *Nanoarch) CoreLoad(meta Metadata) {
 	n.Video.gl.autoCtx = meta.AutoGlContext
 	n.Video.gl.enabled = meta.IsGlAllowed
 
+	thread.SwitchGraphics(n.Video.gl.enabled)
+
 	// hacks
 	Nan0.hackSkipHwContextDestroy = meta.HasHack("skip_hw_context_destroy")
 
@@ -664,7 +666,7 @@ func coreLog(level C.enum_retro_log_level, msg *C.char) {
 	switch level {
 	// with debug level cores have too much logs
 	case C.RETRO_LOG_DEBUG:
-		Nan0.log.Trace().MsgFunc(func() string { return m(msg) })
+		Nan0.log.Debug().MsgFunc(func() string { return m(msg) })
 	case C.RETRO_LOG_INFO:
 		Nan0.log.Info().MsgFunc(func() string { return m(msg) })
 	case C.RETRO_LOG_WARN:
@@ -868,6 +870,7 @@ func deinitVideo() {
 	Nan0.Video.gl.enabled = false
 	Nan0.Video.gl.autoCtx = false
 	Nan0.hackSkipHwContextDestroy = false
+	thread.SwitchGraphics(false)
 }
 
 type limit struct {
