@@ -2,7 +2,6 @@ package coordinator
 
 import (
 	"bytes"
-	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -10,7 +9,6 @@ import (
 	"github.com/giongto35/cloud-game/v3/pkg/api"
 	"github.com/giongto35/cloud-game/v3/pkg/com"
 	"github.com/giongto35/cloud-game/v3/pkg/config"
-	"github.com/giongto35/cloud-game/v3/pkg/games"
 	"github.com/giongto35/cloud-game/v3/pkg/logger"
 )
 
@@ -24,20 +22,18 @@ type Connection interface {
 }
 
 type Hub struct {
-	conf     config.CoordinatorConfig
-	launcher games.Launcher
-	log      *logger.Logger
-	users    com.NetMap[com.Uid, *User]
-	workers  com.NetMap[com.Uid, *Worker]
+	conf    config.CoordinatorConfig
+	log     *logger.Logger
+	users   com.NetMap[com.Uid, *User]
+	workers com.NetMap[com.Uid, *Worker]
 }
 
-func NewHub(conf config.CoordinatorConfig, lib games.GameLibrary, log *logger.Logger) *Hub {
+func NewHub(conf config.CoordinatorConfig, log *logger.Logger) *Hub {
 	return &Hub{
-		conf:     conf,
-		users:    com.NewNetMap[com.Uid, *User](),
-		workers:  com.NewNetMap[com.Uid, *Worker](),
-		launcher: games.NewGameLauncher(lib),
-		log:      log,
+		conf:    conf,
+		users:   com.NewNetMap[com.Uid, *User](),
+		workers: com.NewNetMap[com.Uid, *Worker](),
+		log:     log,
 	}
 }
 
@@ -62,21 +58,29 @@ func (h *Hub) handleUserConnection() http.HandlerFunc {
 
 		user := NewUser(conn, log)
 		defer h.users.RemoveDisconnect(user)
-		done := user.HandleRequests(h, h.launcher, h.conf)
+		done := user.HandleRequests(h, h.conf)
 		params := r.URL.Query()
+
 		worker := h.findWorkerFor(user, params, h.log.Extend(h.log.With().Str("cid", user.Id().Short())))
 		if worker == nil {
 			user.Notify(api.ErrNoFreeSlots, "")
 			h.log.Info().Msg("no free workers")
 			return
 		}
-		user.Bind(worker)
+
+		// Link the user to the selected worker. Slot reservation is handled later
+		// on game start; this keeps connections lightweight and lets deep-link
+		// joins share a worker without consuming its single game slot.
+		user.w = worker
+
 		h.users.Add(user)
-		apps := h.launcher.GetAppNames()
+
+		apps := worker.AppNames()
 		list := make([]api.AppMeta, len(apps))
 		for i := range apps {
-			list[i] = api.AppMeta{Title: apps[i].Name, System: apps[i].System}
+			list[i] = api.AppMeta{Alias: apps[i].Alias, Title: apps[i].Name, System: apps[i].System}
 		}
+
 		user.InitSession(worker.Id().String(), h.conf.Webrtc.IceServers, list)
 		log.Info().Str(logger.DirectionField, logger.MarkPlus).Msgf("user %s", user.Id())
 		<-done
@@ -87,7 +91,7 @@ func RequestToHandshake(data string) (*api.ConnectionRequest[com.Uid], error) {
 	if data == "" {
 		return nil, api.ErrMalformed
 	}
-	handshake, err := api.UnwrapChecked[api.ConnectionRequest[com.Uid]](base64.URLEncoding.DecodeString(data))
+	handshake, err := api.UnwrapChecked[api.ConnectionRequest[com.Uid]]([]byte(data), nil)
 	if err != nil || handshake == nil {
 		return nil, fmt.Errorf("%w (%v)", err, handshake)
 	}
@@ -103,6 +107,8 @@ func (h *Hub) handleWorkerConnection() http.HandlerFunc {
 		Str(logger.ClientField, "w").
 		Str(logger.DirectionField, logger.MarkIn),
 	)
+
+	h.log.Debug().Msgf("WS max message size: %vb", h.conf.Coordinator.MaxWsSize)
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		h.log.Debug().Msgf("Handshake %v", r.Host)
@@ -131,6 +137,7 @@ func (h *Hub) handleWorkerConnection() http.HandlerFunc {
 			log.Error().Err(err).Msg("worker connection fail")
 			return
 		}
+		conn.SetMaxReadSize(h.conf.Coordinator.MaxWsSize)
 
 		worker := NewWorker(conn, *handshake, log)
 		defer h.workers.RemoveDisconnect(worker)
@@ -145,7 +152,7 @@ func (h *Hub) handleWorkerConnection() http.HandlerFunc {
 
 func (h *Hub) GetServerList() (r []api.Server) {
 	debug := h.conf.Coordinator.Debug
-	h.workers.ForEach(func(w *Worker) {
+	for w := range h.workers.Values() {
 		server := api.Server{
 			Addr:    w.Addr,
 			Id:      w.Id(),
@@ -160,7 +167,7 @@ func (h *Hub) GetServerList() (r []api.Server) {
 			server.Room = w.RoomId
 		}
 		r = append(r, server)
-	})
+	}
 	return
 }
 
@@ -168,15 +175,30 @@ func (h *Hub) GetServerList() (r []api.Server) {
 // various conditions.
 func (h *Hub) findWorkerFor(usr *User, q url.Values, log *logger.Logger) *Worker {
 	log.Debug().Msg("Search available workers")
-	roomId := q.Get(api.RoomIdQueryParam)
+	roomIdRaw := q.Get(api.RoomIdQueryParam)
+	sessionId, deepRoomId := api.ExplodeDeepLink(roomIdRaw)
+	roomId := roomIdRaw
+	if deepRoomId != "" {
+		roomId = deepRoomId
+	}
 	zone := q.Get(api.ZoneQueryParam)
 	wid := q.Get(api.WorkerIdParam)
 
 	var worker *Worker
-	if worker = h.findWorkerByRoom(roomId, zone); worker != nil {
+
+	if wid != "" {
+		if worker = h.findWorkerById(wid, h.conf.Coordinator.Debug); worker != nil {
+			log.Debug().Msgf("Worker with id: %v has been found", wid)
+			return worker
+		} else {
+			return nil
+		}
+	}
+
+	if worker = h.findWorkerByRoom(roomIdRaw, roomId, zone); worker != nil {
 		log.Debug().Str("room", roomId).Msg("An existing worker has been found")
-	} else if worker = h.findWorkerById(wid, h.conf.Coordinator.Debug); worker != nil {
-		log.Debug().Msgf("Worker with id: %v has been found", wid)
+	} else if worker = h.findWorkerByPreviousRoom(sessionId); worker != nil {
+		log.Debug().Msgf("Worker %v with the previous room: %v is found", wid, roomId)
 	} else {
 		switch h.conf.Coordinator.Selector {
 		case config.SelectByPing:
@@ -195,23 +217,40 @@ func (h *Hub) findWorkerFor(usr *User, q url.Values, log *logger.Logger) *Worker
 	return worker
 }
 
-func (h *Hub) findWorkerByRoom(id string, region string) *Worker {
+func (h *Hub) findWorkerByPreviousRoom(id string) *Worker {
 	if id == "" {
+		return nil
+	}
+	w, _ := h.workers.FindBy(func(w *Worker) bool {
+		// session and room id are the same
+		return w.HadSession(id) && w.HasSlot()
+	})
+	return w
+}
+
+func (h *Hub) findWorkerByRoom(id string, deepId string, region string) *Worker {
+	if id == "" && deepId == "" {
 		return nil
 	}
 	// if there is zone param, we need to ensure the worker in that zone,
 	// if not we consider the room is missing
-	w, _ := h.workers.FindBy(func(w *Worker) bool { return w.RoomId == id && w.In(region) })
+	w, _ := h.workers.FindBy(func(w *Worker) bool {
+		matchId := w.RoomId == id
+		if !matchId && deepId != "" {
+			matchId = w.RoomId == deepId
+		}
+		return matchId && w.In(region)
+	})
 	return w
 }
 
 func (h *Hub) getAvailableWorkers(region string) []*Worker {
 	var workers []*Worker
-	h.workers.ForEach(func(w *Worker) {
+	for w := range h.workers.Values() {
 		if w.HasSlot() && w.In(region) {
 			workers = append(workers, w)
 		}
-	})
+	}
 	return workers
 }
 

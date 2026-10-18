@@ -3,15 +3,18 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
+
+#define RETRO_ENVIRONMENT_GET_CLEAR_ALL_THREAD_WAITS_CB (3 | 0x800000)
 
 int initialized = 0;
 
 typedef struct {
-	int   type;
-	void* fn;
-	void* arg1;
-	void* arg2;
-	void* result;
+    int   type;
+    void* fn;
+    void* arg1;
+    void* arg2;
+    void* result;
 } call_def_t;
 
 call_def_t call;
@@ -24,6 +27,61 @@ enum call_type {
 
 void *same_thread_with_args(void *f, int type, ...);
 
+// Input State Cache
+
+#define INPUT_MAX_PORTS 4
+#define INPUT_MAX_KEYS 512
+
+typedef struct {
+    uint32_t buttons[INPUT_MAX_PORTS];
+    int16_t analog[INPUT_MAX_PORTS][4];     // LX, LY, RX, RY
+    int16_t triggers[INPUT_MAX_PORTS][2];   // L2, R2
+
+    uint8_t keyboard[INPUT_MAX_KEYS];
+    int16_t mouse_x;
+    int16_t mouse_y;
+    uint8_t mouse_buttons;
+} input_cache_t;
+
+static input_cache_t input_cache = {0};
+
+// Update entire port state at once
+void input_cache_set_port(unsigned port, uint32_t buttons,
+                          int16_t lx, int16_t ly, int16_t rx, int16_t ry,
+                          int16_t l2, int16_t r2) {
+    if (port < INPUT_MAX_PORTS) {
+        input_cache.buttons[port] = buttons;
+        input_cache.analog[port][0] = lx;
+        input_cache.analog[port][1] = ly;
+        input_cache.analog[port][2] = rx;
+        input_cache.analog[port][3] = ry;
+        input_cache.triggers[port][0] = l2;
+        input_cache.triggers[port][1] = r2;
+    }
+}
+
+// Keyboard update
+void input_cache_set_keyboard_key(unsigned id, uint8_t pressed) {
+    if (id < INPUT_MAX_KEYS) {
+        input_cache.keyboard[id] = pressed;
+    }
+}
+
+// Mouse update
+void input_cache_set_mouse(int16_t dx, int16_t dy, uint8_t buttons) {
+    input_cache.mouse_x = dx;
+    input_cache.mouse_y = dy;
+    input_cache.mouse_buttons = buttons;
+}
+
+void input_cache_clear(void) {
+    memset(&input_cache, 0, sizeof(input_cache));
+}
+
+void input_cache_set_keyboard_bulk(const uint8_t *keys, size_t count) {
+    memcpy(input_cache.keyboard, keys, count);
+}
+
 void core_log_cgo(enum retro_log_level level, const char *fmt, ...) {
     char msg[2048] = {0};
     va_list va;
@@ -34,14 +92,12 @@ void core_log_cgo(enum retro_log_level level, const char *fmt, ...) {
     coreLog(level, msg);
 }
 
-void bridge_retro_init(void *f) {
-    core_log_cgo(RETRO_LOG_DEBUG, "Initialization...\n");
+void bridge_call(void *f) {
     ((void (*)(void)) f)();
 }
 
-void bridge_retro_deinit(void *f) {
-    core_log_cgo(RETRO_LOG_DEBUG, "Deinitialiazation...\n");
-    ((void (*)(void)) f)();
+void bridge_set_callback(void *f, void *callback) {
+    ((void (*)(void *))f)(callback);
 }
 
 unsigned bridge_retro_api_version(void *f) {
@@ -60,38 +116,12 @@ bool bridge_retro_set_environment(void *f, void *callback) {
     return ((bool (*)(retro_environment_t)) f)((retro_environment_t) callback);
 }
 
-void bridge_retro_set_video_refresh(void *f, void *callback) {
-    ((bool (*)(retro_video_refresh_t)) f)((retro_video_refresh_t) callback);
-}
-
-void bridge_retro_set_input_poll(void *f, void *callback) {
-    ((bool (*)(retro_input_poll_t)) f)((retro_input_poll_t) callback);
-}
-
 void bridge_retro_set_input_state(void *f, void *callback) {
-    ((bool (*)(retro_input_state_t)) f)((retro_input_state_t) callback);
-}
-
-void bridge_retro_set_audio_sample(void *f, void *callback) {
-    ((bool (*)(retro_audio_sample_t)) f)((retro_audio_sample_t) callback);
-}
-
-void bridge_retro_set_audio_sample_batch(void *f, void *callback) {
-    ((bool (*)(retro_audio_sample_batch_t)) f)((retro_audio_sample_batch_t) callback);
+    ((int16_t (*)(retro_input_state_t)) f)((retro_input_state_t) callback);
 }
 
 bool bridge_retro_load_game(void *f, struct retro_game_info *gi) {
-    core_log_cgo(RETRO_LOG_DEBUG, "Loading the game...\n");
     return ((bool (*)(struct retro_game_info *)) f)(gi);
-}
-
-void bridge_retro_unload_game(void *f) {
-    core_log_cgo(RETRO_LOG_DEBUG, "Unloading the game...\n");
-    ((void (*)(void)) f)();
-}
-
-void bridge_retro_run(void *f) {
-    ((void (*)(void)) f)();
 }
 
 size_t bridge_retro_get_memory_size(void *f, unsigned id) {
@@ -123,12 +153,41 @@ static bool clear_all_thread_waits_cb(unsigned v, void *data) {
     return true;
 }
 
-void bridge_clear_all_thread_waits_cb(void *data) {
-    *(retro_environment_t *)data = clear_all_thread_waits_cb;
+void bridge_retro_keyboard_callback(void *cb, bool down, unsigned keycode, uint32_t character, uint16_t keyModifiers) {
+    (*(retro_keyboard_event_t *) cb)(down, keycode, character, keyModifiers);
 }
 
 bool core_environment_cgo(unsigned cmd, void *data) {
     bool coreEnvironment(unsigned, void *);
+
+    switch (cmd)
+    {
+        case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
+          return false;
+          break;
+        case RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE:
+          return false;
+          break;
+        case RETRO_ENVIRONMENT_GET_CLEAR_ALL_THREAD_WAITS_CB:
+          *(retro_environment_t *)data = clear_all_thread_waits_cb;
+          return true;
+          break;
+        case RETRO_ENVIRONMENT_GET_INPUT_MAX_USERS:
+          *(unsigned *)data = 4;
+          core_log_cgo(RETRO_LOG_DEBUG, "Set max users: %d\n", 4);
+          return true;
+          break;
+        case RETRO_ENVIRONMENT_GET_INPUT_BITMASKS:
+          return false;
+        case RETRO_ENVIRONMENT_SHUTDOWN:
+          return false;
+          break;
+        case RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT:
+          if (data != NULL) *(int *)data = RETRO_SAVESTATE_CONTEXT_NORMAL;
+          return true;
+          break;
+    }
+
     return coreEnvironment(cmd, data);
 }
 
@@ -138,23 +197,87 @@ void core_video_refresh_cgo(void *data, unsigned width, unsigned height, size_t 
 }
 
 void core_input_poll_cgo() {
-    void coreInputPoll();
-    coreInputPoll();
 }
 
 int16_t core_input_state_cgo(unsigned port, unsigned device, unsigned index, unsigned id) {
-    int16_t coreInputState(unsigned, unsigned, unsigned, unsigned);
-    return coreInputState(port, device, index, id);
-}
+    if (port >= INPUT_MAX_PORTS) {
+        return 0;
+    }
 
-void core_audio_sample_cgo(int16_t left, int16_t right) {
-    void coreAudioSample(int16_t, int16_t);
-    coreAudioSample(left, right);
+    switch (device) {
+        case RETRO_DEVICE_JOYPAD:
+            return (int16_t)((input_cache.buttons[port] >> id) & 1);
+
+        case RETRO_DEVICE_ANALOG:
+            switch (index) {
+                case RETRO_DEVICE_INDEX_ANALOG_LEFT:
+                    // id: RETRO_DEVICE_ID_ANALOG_X=0, RETRO_DEVICE_ID_ANALOG_Y=1
+                    if (id <= RETRO_DEVICE_ID_ANALOG_Y) {
+                        return input_cache.analog[port][id];
+                    }
+                    break;
+                case RETRO_DEVICE_INDEX_ANALOG_RIGHT:
+                    // id: RETRO_DEVICE_ID_ANALOG_X=0, RETRO_DEVICE_ID_ANALOG_Y=1
+                    if (id <= RETRO_DEVICE_ID_ANALOG_Y) {
+                        return input_cache.analog[port][2 + id];
+                    }
+                    break;
+                case RETRO_DEVICE_INDEX_ANALOG_BUTTON:
+                    // Any button can be queried as analog
+                    // id = RETRO_DEVICE_ID_JOYPAD_* (0-15)
+                    // For now, only L2/R2 have analog values
+                    switch (id) {
+                        case RETRO_DEVICE_ID_JOYPAD_L2:
+                            return input_cache.triggers[port][0];
+                        case RETRO_DEVICE_ID_JOYPAD_R2:
+                            return input_cache.triggers[port][1];
+                        default:
+                            // Other buttons: return digital as 0 or 0x7fff
+                            return ((input_cache.buttons[port] >> id) & 1) ? 0x7FFF : 0;
+                    }
+                    break;
+            }
+            break;
+
+        case RETRO_DEVICE_KEYBOARD:
+            if (id < INPUT_MAX_KEYS) {
+                return input_cache.keyboard[id] ? 1 : 0;
+            }
+            break;
+
+        case RETRO_DEVICE_MOUSE:
+            switch (id) {
+                case RETRO_DEVICE_ID_MOUSE_X: {
+                    int16_t x = input_cache.mouse_x;
+                    input_cache.mouse_x = 0;
+                    return x;
+                }
+                case RETRO_DEVICE_ID_MOUSE_Y: {
+                    int16_t y = input_cache.mouse_y;
+                    input_cache.mouse_y = 0;
+                    return y;
+                }
+                case RETRO_DEVICE_ID_MOUSE_LEFT:
+                    return (input_cache.mouse_buttons & 0x01) ? 1 : 0;
+                case RETRO_DEVICE_ID_MOUSE_RIGHT:
+                    return (input_cache.mouse_buttons & 0x02) ? 1 : 0;
+                case RETRO_DEVICE_ID_MOUSE_MIDDLE:
+                    return (input_cache.mouse_buttons & 0x04) ? 1 : 0;
+            }
+            break;
+    }
+
+    return 0;
 }
 
 size_t core_audio_sample_batch_cgo(const int16_t *data, size_t frames) {
     size_t coreAudioSampleBatch(const int16_t *, size_t);
     return coreAudioSampleBatch(data, frames);
+}
+
+void core_audio_sample_cgo(int16_t left, int16_t right) {
+    int16_t frame[2] = { left, right };
+    core_audio_sample_batch_cgo(frame, 1);
 }
 
 uintptr_t core_get_current_framebuffer_cgo() {

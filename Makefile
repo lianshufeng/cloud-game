@@ -4,7 +4,8 @@ ROOT = ${REPO_ROOT}/${PROJECT}
 
 CGO_CFLAGS='-g -O3'
 CGO_LDFLAGS='-g -O3'
-GO_TAGS=static
+GO_TAGS=
+TRIMPATH=-trimpath
 
 .PHONY: clean test
 
@@ -23,12 +24,12 @@ clean:
 
 build.coordinator:
 	mkdir -p bin/
-	go build -ldflags "-w -s -X 'main.Version=$(GIT_VERSION)'" -o bin/ ./cmd/coordinator
+	go build $(TRIMPATH) -ldflags "-w -s -X 'main.Version=$(GIT_VERSION)'" -o bin/ ./cmd/coordinator
 
 build.worker:
 	mkdir -p bin/
 	CGO_CFLAGS=${CGO_CFLAGS} CGO_LDFLAGS=${CGO_LDFLAGS} \
-		go build -pgo=auto -buildmode=exe $(if $(GO_TAGS),-tags $(GO_TAGS),) \
+		go build $(TRIMPATH) -pgo=auto -buildmode=exe $(if $(GO_TAGS),-tags $(GO_TAGS),) \
 		-ldflags "-w -s -X 'main.Version=$(GIT_VERSION)'" $(EXT_WFLAGS) \
 		-o bin/ ./cmd/worker
 
@@ -49,9 +50,16 @@ dev.build-local:
 
 dev.run: dev.build-local
 ifeq ($(OS),Windows_NT)
-	./bin/coordinator.exe &	./bin/worker.exe
+	./bin/coordinator.exe & ./bin/worker.exe
 else
 	./bin/coordinator &	./bin/worker
+endif
+
+dev.run.trace: dev.build-local
+ifeq ($(OS),Windows_NT)
+	./bin/coordinator.exe & GST_DEBUG_COLOR_MODE=off GST_TRACERS="latency(flags=pipeline+element)" GST_DEBUG=GST_TRACER:7 GST_DEBUG_FILE=traces.log ./bin/worker.exe
+else
+	GST_DEBUG_COLOR_MODE=off GST_TRACERS="latency(flags=pipeline+element)" GST_DEBUG=GST_TRACER:7 GST_DEBUG_FILE=traces.log ./bin/worker &	./bin/coordinator
 endif
 
 dev.run.debug:

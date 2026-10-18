@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"errors"
 	"fmt"
 	"sync/atomic"
 
@@ -10,8 +11,10 @@ import (
 )
 
 type Worker struct {
+	AppLibrary
 	Connection
 	RegionalClient
+	Session
 	slotted
 
 	Addr       string
@@ -21,6 +24,9 @@ type Worker struct {
 	Tag        string
 	Zone       string
 
+	Lib      []api.GameInfo
+	Sessions map[string]struct{}
+
 	log *logger.Logger
 }
 
@@ -29,11 +35,32 @@ type RegionalClient interface {
 }
 
 type HasUserRegistry interface {
-	Find(com.Uid) *User
+	Find(id string) *User
+}
+
+type AppLibrary interface {
+	SetLib([]api.GameInfo)
+	AppNames() []api.GameInfo
+}
+
+type Session interface {
+	AddSession(id string)
+	// HadSession is true when an old session is found
+	HadSession(id string) bool
+	SetSessions(map[string]struct{})
+}
+
+type AppMeta struct {
+	Alias  string
+	Base   string
+	Name   string
+	Path   string
+	System string
+	Type   string
 }
 
 func NewWorker(sock *com.Connection, handshake api.ConnectionRequest[com.Uid], log *logger.Logger) *Worker {
-	conn := com.NewConnection[api.PT, api.In[com.Uid], api.Out, *api.Out](sock, handshake.Id, log)
+	conn := com.NewConnection[api.PT, api.In[com.Uid], api.Out](sock, handshake.Id, log)
 	return &Worker{
 		Connection: conn,
 		Addr:       handshake.Addr,
@@ -49,37 +76,59 @@ func NewWorker(sock *com.Connection, handshake api.ConnectionRequest[com.Uid], l
 }
 
 func (w *Worker) HandleRequests(users HasUserRegistry) chan struct{} {
-	return w.ProcessPackets(func(p api.In[com.Uid]) error {
-		payload := p.GetPayload()
-		switch p.GetType() {
+	return w.ProcessPackets(func(p api.In[com.Uid]) (err error) {
+		switch p.T {
 		case api.RegisterRoom:
-			rq := api.Unwrap[api.RegisterRoomRequest](payload)
-			if rq == nil {
-				return api.ErrMalformed
-			}
-			w.log.Info().Msgf("set room [%v] = %v", w.Id(), *rq)
-			w.HandleRegisterRoom(*rq)
+			err = api.Do(p, func(d api.RegisterRoomRequest) {
+				w.log.Info().Msgf("set room [%v] = %v", w.Id(), d)
+				w.HandleRegisterRoom(d)
+			})
 		case api.CloseRoom:
-			rq := api.Unwrap[api.CloseRoomRequest](payload)
-			if rq == nil {
-				return api.ErrMalformed
-			}
-			w.HandleCloseRoom(*rq)
-		case api.IceCandidate:
-			rq := api.Unwrap[api.WebrtcIceCandidateRequest[com.Uid]](payload)
-			if rq == nil {
-				return api.ErrMalformed
-			}
-			err := w.HandleIceCandidate(*rq, users)
-			if err != nil {
-				w.log.Error().Err(err).Send()
-				return api.ErrMalformed
-			}
+			err = api.Do(p, w.HandleCloseRoom)
+		case api.WebrtcSignal:
+			err = api.DoE(p, func(rq api.WebrtcSignalRequest) error {
+				if rq.Ice == nil {
+					return fmt.Errorf("ice candidate is missing")
+				}
+				return w.HandleIceCandidate(rq, users)
+			})
+		case api.LibNewGameList:
+			err = api.DoE(p, w.HandleLibGameList)
+		case api.PrevSessions:
+			err = api.DoE(p, w.HandlePrevSessionList)
 		default:
 			w.log.Warn().Msgf("Unknown packet: %+v", p)
 		}
-		return nil
+		if err != nil && !errors.Is(err, api.ErrMalformed) {
+			w.log.Error().Err(err).Send()
+			err = api.ErrMalformed
+		}
+		return
 	})
+}
+
+func (w *Worker) SetLib(list []api.GameInfo) { w.Lib = list }
+
+func (w *Worker) AppNames() []api.GameInfo {
+	return w.Lib
+}
+
+func (w *Worker) AddSession(id string) {
+	// sessions can be uninitialized until the coordinator pushes them to the worker
+	if w.Sessions == nil {
+		return
+	}
+
+	w.Sessions[id] = struct{}{}
+}
+
+func (w *Worker) HadSession(id string) bool {
+	_, ok := w.Sessions[id]
+	return ok
+}
+
+func (w *Worker) SetSessions(sessions map[string]struct{}) {
+	w.Sessions = sessions
 }
 
 // In say whether some worker from this region (zone).
@@ -94,13 +143,40 @@ type slotted int32
 // there are no players in the room (worker).
 func (s *slotted) HasSlot() bool { return atomic.LoadInt32((*int32)(s)) == 0 }
 
-// Reserve increments user counter of the worker.
-func (s *slotted) Reserve() { atomic.AddInt32((*int32)(s), 1) }
+// TryReserve reserves the slot only when it's free.
+func (s *slotted) TryReserve() bool {
+	for {
+		current := atomic.LoadInt32((*int32)(s))
+		if current != 0 {
+			return false
+		}
+		if atomic.CompareAndSwapInt32((*int32)(s), 0, 1) {
+			return true
+		}
+	}
+}
 
 // UnReserve decrements user counter of the worker.
 func (s *slotted) UnReserve() {
-	if atomic.AddInt32((*int32)(s), -1) < 0 {
-		atomic.StoreInt32((*int32)(s), 0)
+	for {
+		current := atomic.LoadInt32((*int32)(s))
+		if current <= 0 {
+			// reset to zero
+			if current < 0 {
+				if atomic.CompareAndSwapInt32((*int32)(s), current, 0) {
+					return
+				}
+				continue
+			}
+
+			return
+		}
+
+		// Regular decrement for positive values
+		newVal := current - 1
+		if atomic.CompareAndSwapInt32((*int32)(s), current, newVal) {
+			return
+		}
 	}
 }
 

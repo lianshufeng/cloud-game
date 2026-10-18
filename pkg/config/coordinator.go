@@ -5,6 +5,7 @@ import "flag"
 type CoordinatorConfig struct {
 	Coordinator Coordinator
 	Emulator    Emulator
+	Library     Library
 	Recording   Recording
 	Version     Version
 	Webrtc      Webrtc
@@ -14,6 +15,7 @@ type Coordinator struct {
 	Analytics  Analytics
 	Debug      bool
 	Library    Library
+	MaxWsSize  int64
 	Monitoring Monitoring
 	Origin     struct {
 		UserWs   string

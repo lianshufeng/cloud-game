@@ -1,8 +1,10 @@
 package games
 
 import (
+	"bufio"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -16,11 +18,13 @@ import (
 
 // libConf is an optimized internal library configuration
 type libConf struct {
-	path      string
-	supported map[string]struct{}
-	ignored   map[string]struct{}
-	verbose   bool
-	watchMode bool
+	aliasFile   string
+	path        string
+	supported   map[string]struct{}
+	ignored     []string
+	verbose     bool
+	watchMode   bool
+	sessionPath string
 }
 
 type library struct {
@@ -36,6 +40,9 @@ type library struct {
 	games map[string]GameMetadata
 	log   *logger.Logger
 
+	// ids of saved games to find closed sessions
+	sessions []string
+
 	emuConf WithEmulatorInfo
 
 	// to restrict parallel execution or throttling
@@ -48,15 +55,20 @@ type library struct {
 type GameLibrary interface {
 	GetAll() []GameMetadata
 	FindGameByName(name string) GameMetadata
+	Sessions() []string
 	Scan()
+	ForEach(func(GameMetadata))
+	GamesCount() int
 }
 
 type WithEmulatorInfo interface {
 	GetSupportedExtensions() []string
 	GetEmulator(rom string, path string) string
+	SessionStoragePath() string
 }
 
 type GameMetadata struct {
+	Alias  string
 	Base   string
 	Name   string // the display name of the game
 	Path   string // the game path relative to the library base path
@@ -85,11 +97,13 @@ func NewLib(conf config.Library, emu WithEmulatorInfo, log *logger.Logger) GameL
 
 	library := &library{
 		config: libConf{
-			path:      dir,
-			supported: toMap(conf.Supported),
-			ignored:   toMap(conf.Ignored),
-			verbose:   conf.Verbose,
-			watchMode: conf.WatchMode,
+			aliasFile:   conf.AliasFile,
+			path:        dir,
+			supported:   toMap(conf.Supported),
+			ignored:     conf.Ignored,
+			verbose:     conf.Verbose,
+			watchMode:   conf.WatchMode,
+			sessionPath: emu.SessionStoragePath(),
 		},
 		mu:        sync.Mutex{},
 		games:     map[string]GameMetadata{},
@@ -105,11 +119,33 @@ func NewLib(conf config.Library, emu WithEmulatorInfo, log *logger.Logger) GameL
 	return library
 }
 
+func (lib *library) Sessions() []string {
+	lib.mu.Lock()
+	defer lib.mu.Unlock()
+	return lib.sessions
+}
+
+func (lib *library) ForEach(fn func(GameMetadata)) {
+	lib.mu.Lock()
+	defer lib.mu.Unlock()
+	for _, v := range lib.games {
+		fn(v)
+	}
+}
+
+func (lib *library) GamesCount() int {
+	lib.mu.Lock()
+	defer lib.mu.Unlock()
+	return len(lib.games)
+}
+
 func (lib *library) GetAll() []GameMetadata {
-	var res []GameMetadata
+	lib.mu.Lock()
+	res := make([]GameMetadata, 0, len(lib.games))
 	for _, value := range lib.games {
 		res = append(res, value)
 	}
+	lib.mu.Unlock()
 	return res
 }
 
@@ -121,6 +157,39 @@ func (lib *library) FindGameByName(name string) GameMetadata {
 		return val
 	}
 	return game
+}
+
+func (lib *library) AliasFileMaybe() map[string]string {
+	if lib.config.aliasFile == "" {
+		return nil
+	}
+
+	path := filepath.Join(lib.config.path, lib.config.aliasFile)
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		lib.log.Error().Msgf("couldn't open alias file, %v", err)
+		return nil
+	}
+	defer func() { _ = file.Close() }()
+
+	aliases := make(map[string]string)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		if id, alias, found := strings.Cut(scanner.Text(), "="); found {
+			aliases[id] = alias
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		lib.log.Error().Msgf("alias file read error, %v", err)
+	}
+
+	return aliases
 }
 
 func (lib *library) Scan() {
@@ -142,6 +211,14 @@ func (lib *library) Scan() {
 
 	lib.log.Debug().Msg("Lib scan... started")
 
+	// game name aliases
+	aliases := lib.AliasFileMaybe()
+
+	if aliases != nil {
+		lib.log.Debug().Msgf("Lib game alises found")
+		lib.log.Debug().Msgf(">>> %v", aliases)
+	}
+
 	start := time.Now()
 	var games []GameMetadata
 	dir := lib.config.path
@@ -150,15 +227,36 @@ func (lib *library) Scan() {
 			return err
 		}
 
-		if info != nil && !info.IsDir() && lib.isExtAllowed(path) {
-			meta := getMetadata(path, dir)
+		if info == nil || info.IsDir() || !lib.isExtAllowed(path) {
+			return nil
+		}
 
-			meta.System = lib.emuConf.GetEmulator(meta.Type, meta.Path)
+		meta := metadata(path, dir)
+		meta.System = lib.emuConf.GetEmulator(meta.Type, meta.Path)
 
-			if _, ok := lib.config.ignored[meta.Name]; !ok {
-				games = append(games, meta)
+		if aliases != nil {
+			if k, ok := aliases[meta.Name]; ok {
+				meta.Alias = k
 			}
 		}
+
+		ignored := false
+		for _, k := range lib.config.ignored {
+			if meta.Name == k {
+				ignored = true
+				break
+			}
+
+			if len(k) > 0 && k[0] == '.' && strings.Contains(meta.Name, k) {
+				ignored = true
+				break
+			}
+		}
+
+		if !ignored {
+			games = append(games, meta)
+		}
+
 		return nil
 	})
 
@@ -168,8 +266,26 @@ func (lib *library) Scan() {
 	}
 
 	if len(games) > 0 {
+		lib.mu.Lock()
 		lib.set(games)
+		lib.mu.Unlock()
 	}
+
+	var sessions []string
+	dir = lib.config.sessionPath
+	err = filepath.WalkDir(dir, func(path string, info fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info != nil && !info.IsDir() {
+			sessions = append(sessions, info.Name())
+		}
+		return nil
+	})
+	lib.mu.Lock()
+	lib.sessions = sessions
+	lib.mu.Unlock()
 
 	lib.lastScanDuration = time.Since(start)
 	if lib.config.verbose {
@@ -244,15 +360,15 @@ func (lib *library) isExtAllowed(path string) bool {
 	return ok
 }
 
-// getMetadata returns game info from a path
-func getMetadata(path string, basePath string) GameMetadata {
+// metadata returns game info from a path
+func metadata(path string, basePath string) GameMetadata {
 	name := filepath.Base(path)
-	ext := strings.ToLower(filepath.Ext(name))
+	ext := filepath.Ext(name)
 	relPath, _ := filepath.Rel(basePath, path)
 
 	return GameMetadata{
 		Name: strings.TrimSuffix(name, ext),
-		Type: ext[1:],
+		Type: strings.ToLower(ext[1:]),
 		Path: relPath,
 	}
 }
@@ -270,7 +386,11 @@ func (lib *library) dumpLibrary() {
 
 	for _, k := range keys {
 		game := lib.games[k]
-		gameList.WriteString(fmt.Sprintf("    %7s   %s (%s)\n", game.System, game.Name, game.Path))
+		alias := game.Alias
+		if alias != "" {
+			alias = fmt.Sprintf("[%s] ", game.Alias)
+		}
+		gameList.WriteString(fmt.Sprintf("    %7s   %s %s(%s)\n", game.System, game.Name, alias, game.Path))
 	}
 
 	lib.log.Debug().Msgf("Lib dump\n"+
@@ -279,9 +399,9 @@ func (lib *library) dumpLibrary() {
 		"--------------------------------------------\n"+
 		"%v"+
 		"--------------------------------------------\n"+
-		"--- ROMs: %03d %26s ---\n"+
+		"--- ROMs: %03d --- Saves: %04d %10s ---\n"+
 		"--------------------------------------------",
-		gameList.String(), len(lib.games), lib.lastScanDuration)
+		gameList.String(), len(lib.games), len(lib.sessions), lib.lastScanDuration)
 }
 
 func toMap(list []string) map[string]struct{} {

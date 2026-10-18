@@ -2,6 +2,7 @@ package libretro
 
 import (
 	"time"
+	"unsafe"
 
 	"github.com/giongto35/cloud-game/v3/pkg/config"
 	"github.com/giongto35/cloud-game/v3/pkg/logger"
@@ -15,17 +16,6 @@ type RecordingFrontend struct {
 }
 
 func WithRecording(fe Emulator, rec bool, user string, game string, conf config.Recording, log *logger.Logger) *RecordingFrontend {
-
-	pix := ""
-	switch fe.PixFormat() {
-	case 0:
-		pix = "rgb1555"
-	case 1:
-		pix = "brga"
-	case 2:
-		pix = "rgb565"
-	}
-
 	rr := &RecordingFrontend{Emulator: fe, rec: recorder.NewRecording(
 		recorder.Meta{UserName: user},
 		log,
@@ -36,7 +26,6 @@ func WithRecording(fe Emulator, rec bool, user string, game string, conf config.
 			Zip:   conf.Zip,
 			Vsync: true,
 			Flip:  fe.Flipped(),
-			Pix:   pix,
 		})}
 	rr.ToggleRecording(rec, user)
 	return rr
@@ -45,7 +34,7 @@ func WithRecording(fe Emulator, rec bool, user string, game string, conf config.
 func (r *RecordingFrontend) SetAudioCb(fn func(app.Audio)) {
 	r.Emulator.SetAudioCb(func(audio app.Audio) {
 		if r.IsRecording() {
-			pcm := audio.Data
+			pcm := unsafe.Slice((*int16)(unsafe.Pointer(unsafe.SliceData(audio.Data))), len(audio.Data)>>1)
 			// example: 1600 = x / 1000 * 48000 * 2
 			l := time.Duration(float64(len(pcm)) / float64(r.AudioSampleRate()<<1) * 1000000000)
 			r.rec.WriteAudio(recorder.Audio{Samples: pcm, Duration: l})
@@ -70,6 +59,7 @@ func (r *RecordingFrontend) LoadGame(path string) error {
 	}
 	r.rec.SetFramerate(float64(r.Emulator.FPS()))
 	r.rec.SetAudioFrequency(r.Emulator.AudioSampleRate())
+	r.rec.SetPixFormat(r.Emulator.PixFormat())
 	return nil
 }
 

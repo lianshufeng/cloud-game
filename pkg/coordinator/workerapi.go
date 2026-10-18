@@ -1,63 +1,64 @@
 package coordinator
 
-import (
-	"github.com/giongto35/cloud-game/v3/pkg/api"
-	"github.com/giongto35/cloud-game/v3/pkg/com"
-	"github.com/giongto35/cloud-game/v3/pkg/games"
-)
+import "github.com/giongto35/cloud-game/v3/pkg/api"
 
-func (w *Worker) WebrtcInit(id com.Uid) (*api.WebrtcInitResponse, error) {
-	return api.UnwrapChecked[api.WebrtcInitResponse](
-		w.Send(api.WebrtcInit, api.WebrtcInitRequest[com.Uid]{Stateful: api.Stateful[com.Uid]{Id: id}}))
+func (w *Worker) InitWebrtcStream(id string, initiator bool, sdp string) (*api.InitWebrtcStreamResponse, error) {
+	return api.UnwrapChecked[api.InitWebrtcStreamResponse](
+		w.Send(api.InitWebrtcStream, api.InitWebrtcStreamRequest{Id: id, Initiator: initiator, Sdp: sdp}))
 }
 
-func (w *Worker) WebrtcAnswer(id com.Uid, sdp string) {
-	w.Notify(api.WebrtcAnswer, api.WebrtcAnswerRequest[com.Uid]{Stateful: api.Stateful[com.Uid]{Id: id}, Sdp: sdp})
+func (w *Worker) WebrtcSignal(id string, sdp, ice *string) {
+	w.Notify(api.WebrtcSignal, api.WebrtcSignalRequest{
+		Stateful: api.Stateful{Id: id}, Ice: ice, Sdp: sdp,
+	})
 }
 
-func (w *Worker) WebrtcIceCandidate(id com.Uid, can string) {
-	w.Notify(api.WebrtcIce, api.WebrtcIceCandidateRequest[com.Uid]{Stateful: api.Stateful[com.Uid]{Id: id}, Candidate: can})
-}
-
-func (w *Worker) StartGame(id com.Uid, app games.AppMeta, req api.GameStartUserRequest) (*api.StartGameResponse, error) {
+func (w *Worker) StartGame(id string, req api.GameStartUserRequest) (*api.StartGameResponse, error) {
 	return api.UnwrapChecked[api.StartGameResponse](
-		w.Send(api.StartGame, api.StartGameRequest[com.Uid]{
-			StatefulRoom: StateRoom(id, req.RoomId),
-			Game:         api.GameInfo(app),
+		w.Send(api.StartGame, api.StartGameRequest{
+			StatefulRoom: api.StatefulRoom{Id: id, Rid: req.RoomId},
+			Game:         req.GameName,
 			PlayerIndex:  req.PlayerIndex,
 			Record:       req.Record,
 			RecordUser:   req.RecordUser,
 		}))
 }
 
-func (w *Worker) QuitGame(id com.Uid) {
-	w.Notify(api.QuitGame, api.GameQuitRequest[com.Uid]{StatefulRoom: StateRoom(id, w.RoomId)})
+func (w *Worker) QuitGame(id string) {
+	w.Notify(api.QuitGame, api.GameQuitRequest{Id: id, Rid: w.RoomId})
 }
 
-func (w *Worker) SaveGame(id com.Uid) (*api.SaveGameResponse, error) {
+func (w *Worker) SaveGame(id string) (*api.SaveGameResponse, error) {
 	return api.UnwrapChecked[api.SaveGameResponse](
-		w.Send(api.SaveGame, api.SaveGameRequest[com.Uid]{StatefulRoom: StateRoom(id, w.RoomId)}))
+		w.Send(api.SaveGame, api.SaveGameRequest{Id: id, Rid: w.RoomId}))
 }
 
-func (w *Worker) LoadGame(id com.Uid) (*api.LoadGameResponse, error) {
+func (w *Worker) LoadGame(id string) (*api.LoadGameResponse, error) {
 	return api.UnwrapChecked[api.LoadGameResponse](
-		w.Send(api.LoadGame, api.LoadGameRequest[com.Uid]{StatefulRoom: StateRoom(id, w.RoomId)}))
+		w.Send(api.LoadGame, api.LoadGameRequest{Id: id, Rid: w.RoomId}))
 }
 
-func (w *Worker) ChangePlayer(id com.Uid, index int) (*api.ChangePlayerResponse, error) {
+func (w *Worker) ChangePlayer(id string, index int) (*api.ChangePlayerResponse, error) {
 	return api.UnwrapChecked[api.ChangePlayerResponse](
-		w.Send(api.ChangePlayer, api.ChangePlayerRequest[com.Uid]{StatefulRoom: StateRoom(id, w.RoomId), Index: index}))
+		w.Send(api.ChangePlayer, api.ChangePlayerRequest{
+			StatefulRoom: api.StatefulRoom{Id: id, Rid: w.RoomId},
+			Index:        index,
+		}))
 }
 
-func (w *Worker) RecordGame(id com.Uid, rec bool, recUser string) (*api.RecordGameResponse, error) {
+func (w *Worker) ResetGame(id string) {
+	w.Notify(api.ResetGame, api.ResetGameRequest{Id: id, Rid: w.RoomId})
+}
+
+func (w *Worker) RecordGame(id string, rec bool, recUser string) (*api.RecordGameResponse, error) {
 	return api.UnwrapChecked[api.RecordGameResponse](
-		w.Send(api.RecordGame, api.RecordGameRequest[com.Uid]{StatefulRoom: StateRoom(id, w.RoomId), Active: rec, User: recUser}))
+		w.Send(api.RecordGame, api.RecordGameRequest{
+			StatefulRoom: api.StatefulRoom{Id: id, Rid: w.RoomId},
+			Active:       rec,
+			User:         recUser,
+		}))
 }
 
-func (w *Worker) TerminateSession(id com.Uid) {
-	_, _ = w.Send(api.TerminateSession, api.TerminateSessionRequest[com.Uid]{Stateful: api.Stateful[com.Uid]{Id: id}})
-}
-
-func StateRoom[T api.Id](id T, rid string) api.StatefulRoom[T] {
-	return api.StatefulRoom[T]{Stateful: api.Stateful[T]{Id: id}, Room: api.Room{Rid: rid}}
+func (w *Worker) TerminateSession(id string) {
+	_, _ = w.Send(api.TerminateSession, api.TerminateSessionRequest{Id: id})
 }

@@ -1,6 +1,7 @@
 package com
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -8,7 +9,6 @@ import (
 	"time"
 
 	"github.com/giongto35/cloud-game/v3/pkg/network/websocket"
-	"github.com/goccy/go-json"
 	"github.com/rs/xid"
 )
 
@@ -29,7 +29,6 @@ func UidFromString(id string) (Uid, error) {
 }
 
 func (u Uid) Short() string { return u.String()[:3] + "." + u.String()[len(u.String())-3:] }
-func (u Uid) Id() string    { return u.String() }
 
 type HasCallId interface {
 	SetGetId(fmt.Stringer)
@@ -72,7 +71,7 @@ type request struct {
 	response []byte
 }
 
-const DefaultCallTimeout = 7 * time.Second
+const DefaultCallTimeout = 10 * time.Second
 
 var errCanceled = errors.New("canceled")
 var errTimeout = errors.New("timeout")
@@ -97,7 +96,9 @@ func (s *Server) Connect(w http.ResponseWriter, r *http.Request) (*Connection, e
 	return connect(s.Server.Connect(w, r, nil))
 }
 
-func (c Connection) IsServer() bool { return c.conn.IsServer() }
+func (c *Connection) IsServer() bool { return c.conn.IsServer() }
+
+func (c *Connection) SetMaxReadSize(s int64) { c.conn.SetMaxMessageSize(s) }
 
 func connect(conn *websocket.Connection, err error) (*Connection, error) {
 	if err != nil {
@@ -131,16 +132,18 @@ func (t *RPC[_, _]) Call(w Writer, rq HasCallId) ([]byte, error) {
 	task := &request{done: make(chan struct{})}
 	t.calls.Put(id, task)
 	w.Write(r)
+	timer := time.NewTimer(t.callTimeout())
 	select {
 	case <-task.done:
-	case <-time.After(t.callTimeout()):
+		timer.Stop()
+	case <-timer.C:
 		task.err = errTimeout
 	}
 	return task.response, task.err
 }
 
 func (t *RPC[_, P]) handleMessage(message []byte) error {
-	res := *new(P)
+	var res P
 	if err := json.Unmarshal(message, &res); err != nil {
 		return err
 	}
@@ -168,10 +171,11 @@ func (t *RPC[_, _]) callTimeout() time.Duration {
 
 func (t *RPC[_, _]) Cleanup() {
 	// drain cancels all what's left in the task queue.
-	t.calls.ForEach(func(task *request) {
+	for task := range t.calls.Values() {
 		if task.err == nil {
 			task.err = errCanceled
 		}
 		close(task.done)
-	})
+	}
+	t.calls.Clear()
 }

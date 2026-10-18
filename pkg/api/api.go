@@ -19,29 +19,30 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 type (
 	Id interface {
 		String() string
 	}
-	Stateful[T Id] struct {
-		Id T `json:"id"`
+	Stateful struct {
+		Id string `json:"id"`
 	}
 	Room struct {
-		Rid string `json:"room_id"` // room id
+		Rid string `json:"room_id"`
 	}
-	StatefulRoom[T Id] struct {
-		Stateful[T]
-		Room
+	StatefulRoom struct {
+		Id  string `json:"id"`
+		Rid string `json:"room_id"`
 	}
 	PT uint8
 )
 
 type In[I Id] struct {
 	Id      I               `json:"id,omitempty"`
-	T       PT              `json:"t"`
 	Payload json.RawMessage `json:"p,omitempty"` // should be json.RawMessage for 2-pass unmarshal
+	T       PT              `json:"t"`
 }
 
 func (i In[I]) GetId() I           { return i.Id }
@@ -49,9 +50,9 @@ func (i In[I]) GetPayload() []byte { return i.Payload }
 func (i In[I]) GetType() PT        { return i.T }
 
 type Out struct {
+	Payload any    `json:"p,omitempty"`
 	Id      string `json:"id,omitempty"` // string because omitempty won't work as intended with arrays
 	T       uint8  `json:"t"`
-	Payload any    `json:"p,omitempty"`
 }
 
 func (o *Out) SetId(s string)          { o.Id = s }
@@ -68,10 +69,8 @@ func (o *Out) GetPayload() any         { return o.Payload }
 const (
 	CheckLatency     PT = 3
 	InitSession      PT = 4
-	WebrtcInit       PT = 100
-	WebrtcOffer      PT = 101
-	WebrtcAnswer     PT = 102
-	WebrtcIce        PT = 103
+	InitWebrtcStream PT = 100
+	WebrtcSignal     PT = 101
 	StartGame        PT = 104
 	QuitGame         PT = 105
 	SaveGame         PT = 106
@@ -80,11 +79,13 @@ const (
 	RecordGame       PT = 110
 	GetWorkerList    PT = 111
 	ErrNoFreeSlots   PT = 112
+	ResetGame        PT = 113
 	RegisterRoom     PT = 201
 	CloseRoom        PT = 202
-	IceCandidate        = WebrtcIce
 	TerminateSession PT = 204
 	AppVideoChange   PT = 150
+	LibNewGameList   PT = 205
+	PrevSessions     PT = 206
 )
 
 func (p PT) String() string {
@@ -93,14 +94,10 @@ func (p PT) String() string {
 		return "CheckLatency"
 	case InitSession:
 		return "InitSession"
-	case WebrtcInit:
-		return "WebrtcInit"
-	case WebrtcOffer:
-		return "WebrtcOffer"
-	case WebrtcAnswer:
-		return "WebrtcAnswer"
-	case WebrtcIce:
-		return "WebrtcIce"
+	case InitWebrtcStream:
+		return "InitWebrtcStream"
+	case WebrtcSignal:
+		return "WebrtcSignal"
 	case StartGame:
 		return "StartGame"
 	case ChangePlayer:
@@ -117,6 +114,8 @@ func (p PT) String() string {
 		return "GetWorkerList"
 	case ErrNoFreeSlots:
 		return "NoFreeSlots"
+	case ResetGame:
+		return "ResetGame"
 	case RegisterRoom:
 		return "RegisterRoom"
 	case CloseRoom:
@@ -125,6 +124,10 @@ func (p PT) String() string {
 		return "TerminateSession"
 	case AppVideoChange:
 		return "AppVideoChange"
+	case LibNewGameList:
+		return "LibNewGameList"
+	case PrevSessions:
+		return "PrevSessions"
 	default:
 		return "Unknown"
 	}
@@ -147,6 +150,21 @@ var (
 	OkPacket    = Out{Payload: "ok"}
 )
 
+func Do[I Id, T any](in In[I], fn func(T)) error {
+	if dat := Unwrap[T](in.Payload); dat != nil {
+		fn(*dat)
+		return nil
+	}
+	return ErrMalformed
+}
+
+func DoE[I Id, T any](in In[I], fn func(T) error) error {
+	if dat := Unwrap[T](in.Payload); dat != nil {
+		return fn(*dat)
+	}
+	return ErrMalformed
+}
+
 func Unwrap[T any](data []byte) *T {
 	out := new(T)
 	if err := json.Unmarshal(data, out); err != nil {
@@ -163,3 +181,15 @@ func UnwrapChecked[T any](bytes []byte, err error) (*T, error) {
 }
 
 func Wrap(t any) ([]byte, error) { return json.Marshal(t) }
+
+const separator = "___"
+
+func ExplodeDeepLink(link string) (string, string) {
+	p := strings.SplitN(link, separator, 2)
+
+	if len(p) == 1 {
+		return p[0], ""
+	}
+
+	return p[0], p[1]
+}

@@ -1,6 +1,9 @@
 package games
 
 import (
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/giongto35/cloud-game/v3/pkg/config"
@@ -60,6 +63,52 @@ func TestLibraryScan(t *testing.T) {
 	}
 }
 
+func TestAliasFileMaybe(t *testing.T) {
+	lib := &library{
+		config: libConf{
+			aliasFile: "alias",
+			path:      os.TempDir(),
+		},
+		log: logger.NewConsole(false, "w", false),
+	}
+
+	contents := "a=b\nc=d\n"
+
+	path := filepath.Join(lib.config.path, lib.config.aliasFile)
+	if err := os.WriteFile(path, []byte(contents), 0644); err != nil {
+		t.Error(err)
+	}
+	defer func() {
+		if err := os.RemoveAll(path); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	want := map[string]string{}
+	want["a"] = "b"
+	want["c"] = "d"
+
+	aliases := lib.AliasFileMaybe()
+
+	if !reflect.DeepEqual(aliases, want) {
+		t.Errorf("AliasFileMaybe() = %v, want %v", aliases, want)
+	}
+}
+
+func TestAliasFileMaybeNot(t *testing.T) {
+	lib := &library{
+		config: libConf{
+			path: os.TempDir(),
+		},
+		log: logger.NewConsole(false, "w", false),
+	}
+
+	aliases := lib.AliasFileMaybe()
+	if aliases != nil {
+		t.Errorf("should be nil, but %v", aliases)
+	}
+}
+
 func Benchmark(b *testing.B) {
 	log := logger.Default()
 	logger.SetGlobalLevel(logger.Disabled)
@@ -68,7 +117,7 @@ func Benchmark(b *testing.B) {
 		Supported: []string{"gba", "zip", "nes"},
 	}, config.Emulator{}, log)
 
-	for range b.N {
+	for b.Loop() {
 		library.Scan()
 		_ = library.GetAll()
 	}

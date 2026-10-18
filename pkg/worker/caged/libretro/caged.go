@@ -11,9 +11,11 @@ import (
 type Caged struct {
 	Emulator
 
-	base *Frontend // maintains the root for mad embedding
-	conf CagedConf
-	log  *logger.Logger
+	base  *Frontend // maintains the root for mad embedding
+	conf  CagedConf
+	log   *logger.Logger
+	Ready <-chan struct{}
+	ready chan struct{}
 }
 
 type CagedConf struct {
@@ -24,13 +26,24 @@ type CagedConf struct {
 func (c *Caged) Name() string { return "libretro" }
 
 func Cage(conf CagedConf, log *logger.Logger) Caged {
-	return Caged{conf: conf, log: log}
+	ch := make(chan struct{})
+	return Caged{conf: conf, log: log, Ready: ch, ready: ch}
 }
 
 func (c *Caged) Init() error {
-	if err := manager.CheckCores(c.conf.Emulator, c.log); err != nil {
-		c.log.Warn().Err(err).Msgf("a Libretro cores sync fail")
+	go func() {
+		defer close(c.ready)
+		if err := manager.CheckCores(c.conf.Emulator, c.log); err != nil {
+			c.log.Warn().Err(err).Msgf("a Libretro cores sync fail")
+		}
+	}()
+
+	if c.conf.Emulator.FailFast {
+		if err := c.IsSupported(); err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
@@ -79,15 +92,17 @@ func (c *Caged) EnableCloudStorage(uid string, storage cloud.Storage) {
 	}
 }
 
-func (c *Caged) AspectEnabled() bool               { return c.base.nano.Aspect }
-func (c *Caged) AspectRatio() float32              { return c.base.AspectRatio() }
-func (c *Caged) PixFormat() uint32                 { return c.Emulator.PixFormat() }
-func (c *Caged) Rotation() uint                    { return c.Emulator.Rotation() }
-func (c *Caged) AudioSampleRate() int              { return c.Emulator.AudioSampleRate() }
-func (c *Caged) ViewportSize() (int, int)          { return c.base.ViewportSize() }
-func (c *Caged) Scale() float64                    { return c.Emulator.Scale() }
-func (c *Caged) SendControl(port int, data []byte) { c.base.Input(port, data) }
-func (c *Caged) Start()                            { go c.Emulator.Start() }
-func (c *Caged) SetSaveOnClose(v bool)             { c.base.SaveOnClose = v }
-func (c *Caged) SetSessionId(name string)          { c.base.SetSessionId(name) }
-func (c *Caged) Close()                            { c.Emulator.Close() }
+func (c *Caged) AspectEnabled() bool              { return c.base.nano.Aspect }
+func (c *Caged) AspectRatio() float32             { return c.base.AspectRatio() }
+func (c *Caged) PixFormat() uint32                { return c.Emulator.PixFormat() }
+func (c *Caged) Rotation() uint                   { return c.Emulator.Rotation() }
+func (c *Caged) AudioSampleRate() int             { return c.Emulator.AudioSampleRate() }
+func (c *Caged) ViewportSize() (int, int)         { return c.base.ViewportSize() }
+func (c *Caged) Scale() (float64, string)         { return c.Emulator.Scale() }
+func (c *Caged) Input(p int, d byte, data []byte) { c.base.Input(p, d, data) }
+func (c *Caged) KbMouseSupport() bool             { return c.base.KbMouseSupport() }
+func (c *Caged) Start()                           { go c.Emulator.Start() }
+func (c *Caged) SetSaveOnClose(v bool)            { c.base.SaveOnClose = v }
+func (c *Caged) SetSessionId(name string)         { c.base.SetSessionId(name) }
+func (c *Caged) Close()                           { c.Emulator.Close() }
+func (c *Caged) IsSupported() error               { return c.base.IsSupported() }

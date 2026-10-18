@@ -6,6 +6,7 @@ import (
 	"github.com/giongto35/cloud-game/v3/pkg/api"
 	"github.com/giongto35/cloud-game/v3/pkg/com"
 	"github.com/giongto35/cloud-game/v3/pkg/config"
+	"github.com/giongto35/cloud-game/v3/pkg/games"
 	"github.com/giongto35/cloud-game/v3/pkg/logger"
 	"github.com/giongto35/cloud-game/v3/pkg/network/webrtc"
 )
@@ -14,6 +15,7 @@ type Connection interface {
 	Disconnect()
 	Id() com.Uid
 	ProcessPackets(func(api.In[com.Uid]) error) chan struct{}
+	SetErrorHandler(func(error))
 
 	Send(api.PT, any) ([]byte, error)
 	Notify(api.PT, any)
@@ -53,7 +55,7 @@ func newCoordinatorConnection(host string, conf config.Worker, addr string, log 
 	}
 
 	clog := log.Extend(log.With().Str(logger.ClientField, "c"))
-	client := com.NewConnection[api.PT, api.In[com.Uid], api.Out, *api.Out](conn, id, clog)
+	client := com.NewConnection[api.PT, api.In[com.Uid], api.Out](conn, id, clog)
 
 	return &coordinator{
 		Connection: client,
@@ -66,78 +68,39 @@ func (c *coordinator) HandleRequests(w *Worker) chan struct{} {
 	if err != nil {
 		c.log.Panic().Err(err).Msg("WebRTC API creation has been failed")
 	}
-	skipped := api.Out{}
 
 	return c.ProcessPackets(func(x api.In[com.Uid]) (err error) {
 		var out api.Out
+
 		switch x.T {
-		case api.WebrtcInit:
-			if dat := api.Unwrap[api.WebrtcInitRequest[com.Uid]](x.Payload); dat == nil {
-				err, out = api.ErrMalformed, api.EmptyPacket
-			} else {
-				out = c.HandleWebrtcInit(*dat, w, ap)
-			}
-		case api.WebrtcAnswer:
-			dat := api.Unwrap[api.WebrtcAnswerRequest[com.Uid]](x.Payload)
-			if dat == nil {
-				return api.ErrMalformed
-			}
-			c.HandleWebrtcAnswer(*dat, w)
-		case api.WebrtcIce:
-			dat := api.Unwrap[api.WebrtcIceCandidateRequest[com.Uid]](x.Payload)
-			if dat == nil {
-				return api.ErrMalformed
-			}
-			c.HandleWebrtcIceCandidate(*dat, w)
+		case api.InitWebrtcStream:
+			err = api.Do(x, func(d api.InitWebrtcStreamRequest) { out = c.HandleInitWebrtcStream(d, w, ap) })
 		case api.StartGame:
-			if dat := api.Unwrap[api.StartGameRequest[com.Uid]](x.Payload); dat == nil {
-				err, out = api.ErrMalformed, api.EmptyPacket
-			} else {
-				out = c.HandleGameStart(*dat, w)
-			}
-		case api.TerminateSession:
-			dat := api.Unwrap[api.TerminateSessionRequest[com.Uid]](x.Payload)
-			if dat == nil {
-				return api.ErrMalformed
-			}
-			c.HandleTerminateSession(*dat, w)
-		case api.QuitGame:
-			dat := api.Unwrap[api.GameQuitRequest[com.Uid]](x.Payload)
-			if dat == nil {
-				return api.ErrMalformed
-			}
-			c.HandleQuitGame(*dat, w)
+			err = api.Do(x, func(d api.StartGameRequest) { out = c.HandleGameStart(d, w) })
 		case api.SaveGame:
-			if dat := api.Unwrap[api.SaveGameRequest[com.Uid]](x.Payload); dat == nil {
-				err, out = api.ErrMalformed, api.EmptyPacket
-			} else {
-				out = c.HandleSaveGame(*dat, w)
-			}
+			err = api.Do(x, func(d api.SaveGameRequest) { out = c.HandleSaveGame(d, w) })
 		case api.LoadGame:
-			if dat := api.Unwrap[api.LoadGameRequest[com.Uid]](x.Payload); dat == nil {
-				err, out = api.ErrMalformed, api.EmptyPacket
-			} else {
-				out = c.HandleLoadGame(*dat, w)
-			}
+			err = api.Do(x, func(d api.LoadGameRequest) { out = c.HandleLoadGame(d, w) })
 		case api.ChangePlayer:
-			if dat := api.Unwrap[api.ChangePlayerRequest[com.Uid]](x.Payload); dat == nil {
-				err, out = api.ErrMalformed, api.EmptyPacket
-			} else {
-				out = c.HandleChangePlayer(*dat, w)
-			}
+			err = api.Do(x, func(d api.ChangePlayerRequest) { out = c.HandleChangePlayer(d, w) })
 		case api.RecordGame:
-			if dat := api.Unwrap[api.RecordGameRequest[com.Uid]](x.Payload); dat == nil {
-				err, out = api.ErrMalformed, api.EmptyPacket
-			} else {
-				out = c.HandleRecordGame(*dat, w)
-			}
+			err = api.Do(x, func(d api.RecordGameRequest) { out = c.HandleRecordGame(d, w) })
+		case api.WebrtcSignal:
+			err = api.Do(x, func(d api.WebrtcSignalRequest) { c.HandleWebrtcSignal(d, w) })
+		case api.TerminateSession:
+			err = api.Do(x, func(d api.TerminateSessionRequest) { c.HandleTerminateSession(d, w) })
+		case api.QuitGame:
+			err = api.Do(x, func(d api.GameQuitRequest) { c.HandleQuitGame(d, w) })
+		case api.ResetGame:
+			err = api.Do(x, func(d api.ResetGameRequest) { c.HandleResetGame(d, w) })
 		default:
 			c.log.Warn().Msgf("unhandled packet type %v", x.T)
 		}
-		if out != skipped {
+
+		if out != (api.Out{}) {
 			w.cord.Route(x, &out)
 		}
-		return err
+		return
 	})
 }
 
@@ -145,6 +108,32 @@ func (c *coordinator) RegisterRoom(id string) { c.Notify(api.RegisterRoom, id) }
 
 // CloseRoom sends a signal to coordinator which will remove that room from its list.
 func (c *coordinator) CloseRoom(id string) { c.Notify(api.CloseRoom, id) }
-func (c *coordinator) IceCandidate(candidate string, sessionId com.Uid) {
-	c.Notify(api.WebrtcIce, api.WebrtcIceCandidateRequest[com.Uid]{Stateful: api.Stateful[com.Uid]{Id: sessionId}, Candidate: candidate})
+func (c *coordinator) IceCandidate(candidate string, sessionId string) {
+	c.Notify(api.WebrtcSignal, api.WebrtcSignalRequest{
+		Stateful: api.Stateful{Id: sessionId},
+		Ice:      &candidate,
+	})
+}
+
+func (c *coordinator) SendLibrary(w *Worker) {
+	gg := make([]api.GameInfo, 0, w.lib.GamesCount())
+	w.lib.ForEach(func(g games.GameMetadata) {
+		gg = append(gg, api.GameInfo(g))
+	})
+
+	c.Notify(api.LibNewGameList, api.LibGameListInfo{T: 1, List: gg})
+}
+
+func (c *coordinator) SendPrevSessions(w *Worker) {
+	sessions := w.lib.Sessions()
+
+	// extract ids from save states, i.e. sessions
+	ids := make([]string, 0, len(sessions))
+
+	for _, id := range sessions {
+		x, _ := api.ExplodeDeepLink(id)
+		ids = append(ids, x)
+	}
+
+	c.Notify(api.PrevSessions, api.PrevSessionInfo{List: ids})
 }

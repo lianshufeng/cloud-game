@@ -14,6 +14,7 @@ type Launcher interface {
 }
 
 type AppMeta struct {
+	Alias  string
 	Base   string
 	Name   string
 	Path   string
@@ -38,9 +39,10 @@ func (gl GameLauncher) FindAppByName(name string) (AppMeta, error) {
 func (gl GameLauncher) ExtractAppNameFromUrl(name string) string { return ExtractGame(name) }
 
 func (gl GameLauncher) GetAppNames() (apps []AppMeta) {
-	for _, game := range gl.lib.GetAll() {
-		apps = append(apps, AppMeta{Name: game.Name, System: game.System})
-	}
+	apps = make([]AppMeta, 0, gl.lib.GamesCount())
+	gl.lib.ForEach(func(game GameMetadata) {
+		apps = append(apps, AppMeta{Alias: game.Alias, Name: game.Name, System: game.System})
+	})
 	return
 }
 

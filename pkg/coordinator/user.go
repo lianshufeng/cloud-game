@@ -4,7 +4,6 @@ import (
 	"github.com/giongto35/cloud-game/v3/pkg/api"
 	"github.com/giongto35/cloud-game/v3/pkg/com"
 	"github.com/giongto35/cloud-game/v3/pkg/config"
-	"github.com/giongto35/cloud-game/v3/pkg/games"
 	"github.com/giongto35/cloud-game/v3/pkg/logger"
 )
 
@@ -19,7 +18,7 @@ type HasServerInfo interface {
 }
 
 func NewUser(sock *com.Connection, log *logger.Logger) *User {
-	conn := com.NewConnection[api.PT, api.In[com.Uid], api.Out, *api.Out](sock, com.NewUid(), log)
+	conn := com.NewConnection[api.PT, api.In[com.Uid], api.Out](sock, com.NewUid(), log)
 	return &User{
 		Connection: conn,
 		log: log.Extend(log.With().
@@ -29,75 +28,50 @@ func NewUser(sock *com.Connection, log *logger.Logger) *User {
 	}
 }
 
-func (u *User) Bind(w *Worker) {
+func (u *User) Bind(w *Worker) bool {
 	u.w = w
-	u.w.Reserve()
+	// Binding only links the worker; slot reservation is handled lazily on
+	// game start to avoid blocking deep-link joins or parallel connections
+	// that haven't started a game yet.
+	return true
 }
 
 func (u *User) Disconnect() {
 	u.Connection.Disconnect()
 	if u.w != nil {
-		u.w.UnReserve()
-		u.w.TerminateSession(u.Id())
+		u.w.TerminateSession(u.Id().String())
 	}
 }
 
-func (u *User) HandleRequests(info HasServerInfo, launcher games.Launcher, conf config.CoordinatorConfig) chan struct{} {
-	return u.ProcessPackets(func(x api.In[com.Uid]) error {
-		payload := x.GetPayload()
-		switch x.GetType() {
-		case api.WebrtcInit:
-			if u.w != nil {
-				u.HandleWebrtcInit()
-			}
-		case api.WebrtcAnswer:
-			rq := api.Unwrap[api.WebrtcAnswerUserRequest](payload)
-			if rq == nil {
-				return api.ErrMalformed
-			}
-			u.HandleWebrtcAnswer(*rq)
-		case api.WebrtcIce:
-			rq := api.Unwrap[api.WebrtcUserIceCandidate](payload)
-			if rq == nil {
-				return api.ErrMalformed
-			}
-			u.HandleWebrtcIceCandidate(*rq)
+func (u *User) HandleRequests(info HasServerInfo, conf config.CoordinatorConfig) chan struct{} {
+	return u.ProcessPackets(func(x api.In[com.Uid]) (err error) {
+		switch x.T {
+		case api.InitWebrtcStream:
+			err = api.Do(x, u.HandleInitWebrtcStream)
+		case api.WebrtcSignal:
+			err = api.Do(x, u.HandleWebrtcSignal)
 		case api.StartGame:
-			rq := api.Unwrap[api.GameStartUserRequest](payload)
-			if rq == nil {
-				return api.ErrMalformed
-			}
-			u.HandleStartGame(*rq, launcher, conf)
+			err = api.Do(x, func(d api.GameStartUserRequest) { u.HandleStartGame(d, conf) })
 		case api.QuitGame:
-			rq := api.Unwrap[api.GameQuitRequest[com.Uid]](payload)
-			if rq == nil {
-				return api.ErrMalformed
-			}
-			u.HandleQuitGame(*rq)
+			err = api.Do(x, u.HandleQuitGame)
 		case api.SaveGame:
-			return u.HandleSaveGame()
+			err = u.HandleSaveGame()
 		case api.LoadGame:
-			return u.HandleLoadGame()
+			err = u.HandleLoadGame()
 		case api.ChangePlayer:
-			rq := api.Unwrap[api.ChangePlayerUserRequest](payload)
-			if rq == nil {
-				return api.ErrMalformed
-			}
-			u.HandleChangePlayer(*rq)
+			err = api.Do(x, u.HandleChangePlayer)
+		case api.ResetGame:
+			err = api.Do(x, u.HandleResetGame)
 		case api.RecordGame:
 			if !conf.Recording.Enabled {
 				return api.ErrForbidden
 			}
-			rq := api.Unwrap[api.RecordGameRequest[com.Uid]](payload)
-			if rq == nil {
-				return api.ErrMalformed
-			}
-			u.HandleRecordGame(*rq)
+			err = api.Do(x, u.HandleRecordGame)
 		case api.GetWorkerList:
 			u.handleGetWorkerList(conf.Coordinator.Debug, info)
 		default:
 			u.log.Warn().Msgf("Unknown packet: %+v", x)
 		}
-		return nil
+		return
 	})
 }

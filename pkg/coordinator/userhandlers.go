@@ -2,15 +2,18 @@ package coordinator
 
 import (
 	"sort"
+	"time"
 
 	"github.com/giongto35/cloud-game/v3/pkg/api"
-	"github.com/giongto35/cloud-game/v3/pkg/com"
 	"github.com/giongto35/cloud-game/v3/pkg/config"
-	"github.com/giongto35/cloud-game/v3/pkg/games"
 )
 
-func (u *User) HandleWebrtcInit() {
-	resp, err := u.w.WebrtcInit(u.Id())
+func (u *User) HandleInitWebrtcStream(rq api.InitUserWebrtcStreamRequest) {
+	if u.w == nil {
+		u.log.Warn().Msg("no worker assigned")
+		return
+	}
+	resp, err := u.w.InitWebrtcStream(u.Id().String(), rq.Initiator, rq.Sdp)
 	if err != nil || resp == nil || *resp == api.EMPTY {
 		u.log.Error().Err(err).Msg("malformed WebRTC init response")
 		return
@@ -18,35 +21,62 @@ func (u *User) HandleWebrtcInit() {
 	u.SendWebrtcOffer(string(*resp))
 }
 
-func (u *User) HandleWebrtcAnswer(rq api.WebrtcAnswerUserRequest) {
-	u.w.WebrtcAnswer(u.Id(), string(rq))
+func (u *User) HandleWebrtcSignal(rq api.WebrtcSignalUser) {
+	u.w.WebrtcSignal(u.Id().String(), rq.Sdp, rq.Ice)
 }
 
-func (u *User) HandleWebrtcIceCandidate(rq api.WebrtcUserIceCandidate) {
-	u.w.WebrtcIceCandidate(u.Id(), string(rq))
-}
+func (u *User) HandleStartGame(rq api.GameStartUserRequest, conf config.CoordinatorConfig) {
+	// Worker slot / room gating:
+	// - If the worker is BUSY (no free slot), we must not create another room.
+	//   * If the worker has already reported a room id, only allow requests
+	//     for that same room (deep-link joins / reloads).
+	//   * If the worker hasn't reported a room yet, deny any new StartGame to
+	//     avoid racing concurrent room creation on the worker.
+	//   * When the user is starting a NEW game (empty room id), we give the
+	//     worker a short grace period to close the previous room and free the
+	//     slot before rejecting with "no slots".
+	// - If the worker is FREE, reserve the slot lazily before starting the
+	//   game; the room id (if any) comes from the request / worker.
 
-func (u *User) HandleStartGame(rq api.GameStartUserRequest, launcher games.Launcher, conf config.CoordinatorConfig) {
-	// +injects game data into the original game request
-	// the name of the game either in the `room id` field or
-	// it's in the initial request
-	game := rq.GameName
-	if rq.RoomId != "" {
-		name := launcher.ExtractAppNameFromUrl(rq.RoomId)
-		if name == "" {
-			u.log.Warn().Msg("couldn't decode game name from the room id")
+	// Grace period: when there's no room id in the request (new game) but the
+	// worker still appears busy, wait a bit for the previous room to close.
+	if rq.RoomId == "" && !u.w.HasSlot() {
+		const waitTotal = 3 * time.Second
+		const step = 100 * time.Millisecond
+		waited := time.Duration(0)
+		for waited < waitTotal {
+			if u.w.HasSlot() {
+				break
+			}
+			time.Sleep(step)
+			waited += step
+		}
+	}
+
+	busy := !u.w.HasSlot()
+	if busy {
+		if u.w.RoomId == "" {
+			u.Notify(api.ErrNoFreeSlots, "")
 			return
 		}
-		game = name
+		// if rq.RoomId == "" {
+		// 	// No room id but worker is busy -> assume user wants to continue
+		// 	// the existing room instead of starting a parallel game.
+		// 	rq.RoomId = u.w.RoomId
+		// } else
+		if rq.RoomId != u.w.RoomId {
+			u.Notify(api.ErrNoFreeSlots, "")
+			return
+		}
+	} else {
+		// Worker is free: try to reserve the single slot for this new room.
+		if !u.w.TryReserve() {
+			u.Notify(api.ErrNoFreeSlots, "")
+			return
+		}
 	}
 
-	gameInfo, err := launcher.FindAppByName(game)
-	if err != nil {
-		u.log.Error().Err(err).Send()
-		return
-	}
-
-	startGameResp, err := u.w.StartGame(u.Id(), gameInfo, rq)
+	startGameResp, err := u.w.StartGame(u.Id().String(), rq)
 	if err != nil || startGameResp == nil {
 		u.log.Error().Err(err).Msg("malformed game start response")
 		return
@@ -56,7 +86,7 @@ func (u *User) HandleStartGame(rq api.GameStartUserRequest, launcher games.Launc
 		return
 	}
 	u.log.Info().Str("id", startGameResp.Rid).Msg("Received room response from worker")
-	u.StartGame(startGameResp.AV)
+	u.StartGame(startGameResp.AV, startGameResp.KbMouse)
 
 	// send back recording status
 	if conf.Recording.Enabled && rq.Record {
@@ -64,23 +94,37 @@ func (u *User) HandleStartGame(rq api.GameStartUserRequest, launcher games.Launc
 	}
 }
 
-func (u *User) HandleQuitGame(rq api.GameQuitRequest[com.Uid]) {
-	if rq.Room.Rid == u.w.RoomId {
-		u.w.QuitGame(u.Id())
+func (u *User) HandleQuitGame(rq api.GameQuitRequest) {
+	if rq.Rid == u.w.RoomId {
+		u.w.QuitGame(u.Id().String())
 	}
 }
 
+func (u *User) HandleResetGame(rq api.ResetGameRequest) {
+	if rq.Rid != u.w.RoomId {
+		return
+	}
+	u.w.ResetGame(u.Id().String())
+}
+
 func (u *User) HandleSaveGame() error {
-	resp, err := u.w.SaveGame(u.Id())
+	resp, err := u.w.SaveGame(u.Id().String())
 	if err != nil {
 		return err
 	}
+
+	if *resp == api.OK {
+		if id, _ := api.ExplodeDeepLink(u.w.RoomId); id != "" {
+			u.w.AddSession(id)
+		}
+	}
+
 	u.Notify(api.SaveGame, resp)
 	return nil
 }
 
 func (u *User) HandleLoadGame() error {
-	resp, err := u.w.LoadGame(u.Id())
+	resp, err := u.w.LoadGame(u.Id().String())
 	if err != nil {
 		return err
 	}
@@ -89,7 +133,7 @@ func (u *User) HandleLoadGame() error {
 }
 
 func (u *User) HandleChangePlayer(rq api.ChangePlayerUserRequest) {
-	resp, err := u.w.ChangePlayer(u.Id(), int(rq))
+	resp, err := u.w.ChangePlayer(u.Id().String(), int(rq))
 	// !to make it a little less convoluted
 	if err != nil || resp == nil || *resp == -1 {
 		u.log.Error().Err(err).Msgf("player select fail, req: %v", rq)
@@ -98,7 +142,7 @@ func (u *User) HandleChangePlayer(rq api.ChangePlayerUserRequest) {
 	u.Notify(api.ChangePlayer, rq)
 }
 
-func (u *User) HandleRecordGame(rq api.RecordGameRequest[com.Uid]) {
+func (u *User) HandleRecordGame(rq api.RecordGameRequest) {
 	if u.w == nil {
 		return
 	}
@@ -110,7 +154,7 @@ func (u *User) HandleRecordGame(rq api.RecordGameRequest[com.Uid]) {
 		return
 	}
 
-	resp, err := u.w.RecordGame(u.Id(), rq.Active, rq.User)
+	resp, err := u.w.RecordGame(u.Id().String(), rq.Active, rq.User)
 	if err != nil {
 		u.log.Error().Err(err).Msg("malformed game record request")
 		return

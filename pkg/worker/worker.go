@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/giongto35/cloud-game/v3/pkg/config"
+	"github.com/giongto35/cloud-game/v3/pkg/games"
 	"github.com/giongto35/cloud-game/v3/pkg/logger"
 	"github.com/giongto35/cloud-game/v3/pkg/monitoring"
 	"github.com/giongto35/cloud-game/v3/pkg/network/httpx"
@@ -18,24 +19,35 @@ type Worker struct {
 	address  string
 	conf     config.WorkerConfig
 	cord     *coordinator
+	lib      games.GameLibrary
+	launcher games.Launcher
 	log      *logger.Logger
 	mana     *caged.Manager
 	router   *room.GameRouter
-	services [3]interface {
+	services [2]interface {
 		Run()
 		Stop() error
 	}
 	storage cloud.Storage
 }
 
-const retry = 10 * time.Second
-
 func New(conf config.WorkerConfig, log *logger.Logger) (*Worker, error) {
 	manager := caged.NewManager(log)
 	if err := manager.Load(caged.Libretro, conf); err != nil {
 		return nil, fmt.Errorf("couldn't cage libretro: %v", err)
 	}
-	worker := &Worker{conf: conf, log: log, mana: manager, router: room.NewGameRouter()}
+
+	library := games.NewLib(conf.Library, conf.Emulator, log)
+	library.Scan()
+
+	worker := &Worker{
+		conf:     conf,
+		lib:      library,
+		launcher: games.NewGameLauncher(library),
+		log:      log,
+		mana:     manager,
+		router:   room.NewGameRouter(),
+	}
 
 	h, err := httpx.NewServer(
 		conf.Worker.GetAddr(),
@@ -64,7 +76,6 @@ func New(conf config.WorkerConfig, log *logger.Logger) (*Worker, error) {
 		log.Warn().Err(err).Msgf("cloud storage fail, using no storage")
 	}
 	worker.storage = st
-	worker.services[2] = NewWatcher(30*time.Minute, worker.router, log)
 
 	return worker, nil
 }
@@ -79,6 +90,11 @@ func (w *Worker) Start(done chan struct{}) {
 	}
 
 	// !to restore alive worker info when coordinator connection was lost
+	retryStep := 5 * time.Second
+	onRetryFail := func(err error) {
+		w.log.Warn().Err(err).Msgf("socket fail. Retrying in %v", retryStep)
+		backoff(&retryStep, 1*time.Hour)
+	}
 
 	go func() {
 		remoteAddr := w.conf.Worker.Network.CoordinatorAddress
@@ -94,22 +110,27 @@ func (w *Worker) Start(done chan struct{}) {
 			case <-done:
 				return
 			default:
+				w.Reset()
 				cord, err := newCoordinatorConnection(remoteAddr, w.conf.Worker, w.address, w.log)
 				if err != nil {
-					w.log.Warn().Err(err).Msgf("no connection: %v. Retrying in %v", remoteAddr, retry)
-					time.Sleep(retry)
+					onRetryFail(err)
 					continue
 				}
+				cord.SetErrorHandler(onRetryFail)
 				w.cord = cord
 				w.cord.log.Info().Msgf("Connected to the coordinator %v", remoteAddr)
-				<-w.cord.HandleRequests(w)
-				w.Reset()
+				wait := w.cord.HandleRequests(w)
+				w.cord.SendLibrary(w)
+				w.cord.SendPrevSessions(w)
+				<-wait
+				retryStep = 5 * time.Second
 			}
 		}
 	}()
 }
 
 func (w *Worker) Stop() error {
+	w.Reset()
 	var err error
 	for _, s := range w.services {
 		if s != nil {
@@ -119,3 +140,6 @@ func (w *Worker) Stop() error {
 	}
 	return err
 }
+
+// backoff doubles the sleep duration up to the max
+func backoff(d *time.Duration, max time.Duration) { time.Sleep(*d); *d = min(*d*2, max) }

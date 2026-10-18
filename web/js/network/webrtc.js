@@ -1,176 +1,278 @@
-import {
-    pub,
-    WEBRTC_CONNECTION_CLOSED,
-    WEBRTC_CONNECTION_READY,
-    WEBRTC_ICE_CANDIDATE_FOUND,
-    WEBRTC_ICE_CANDIDATES_FLUSH,
-    WEBRTC_SDP_ANSWER
-} from 'event';
-import {log} from 'log';
+import { log } from "log";
 
-let connection;
-let dataChannel;
-let mediaStream;
-let candidates = [];
-let isAnswered = false;
-let isFlushing = false;
+let /** @type {RTCPeerConnection} */ pc;
+let /** @type {Map<string, RTCDataChannel>} */ channels = new Map();
+let /** @type {MediaStream} */ stream;
+let caller = false;
+let signal;
 
-let connected = false;
-let inputReady = false;
+const ice = ((signaller) => {
+    // Buffer is used to store ICE candidates while
+    // the remote description is not available.
+    // Then it is flushed as soon as the remote description is set.
+    let /** @type {RTCIceCandidateInit[]} */ buf = [];
 
-let onData;
+    const END_OF_CANDIDATES = null;
 
-const start = (iceservers) => {
-    log.info('[rtc] <- ICE servers', iceservers);
-    const servers = iceservers || [];
-    connection = new RTCPeerConnection({iceServers: servers});
-    mediaStream = new MediaStream();
+    const onCandidate = (/** @type {RTCPeerConnectionIceEvent} */ ev) => {
+        if (!ev.candidate) return;
+        log.debug(`[rtc] [ice] local`, ev.candidate);
+        signaller()?.sendIceCandidate(ev.candidate);
+    };
 
-    connection.ondatachannel = e => {
-        log.debug('[rtc] ondatachannel', e.channel.label)
-        e.channel.binaryType = "arraybuffer";
+    const onCandidateError = (
+        /** @type {RTCPeerConnectionIceErrorEvent} */ ev,
+    ) => {
+        let { address, errorCode, errorText, url } = ev;
+        if (errorCode === 701) errorText = "couldn't reach the server";
+        log.debug(
+            `[rtc] [ice] candidate error: ${address || ""} ${errorCode}: ${errorText} / ${url}`,
+        );
+    };
 
-        dataChannel = e.channel;
-        dataChannel.onopen = () => {
-            log.info('[rtc] the input channel has been opened');
-            inputReady = true;
-            pub(WEBRTC_CONNECTION_READY)
-        };
-        if (onData) {
-            dataChannel.onmessage = onData;
+    const onGatheringStateChange = (event) => {
+        const /** @type {RTCPeerConnection} */ t = event.target;
+        log.debug(`[rtc] [ice] state: ${t.iceGatheringState}`);
+    };
+
+    const onConnectionStateChange = (pc) => {
+        log.debug(`[rtc] [ice] connection state: ${pc.iceConnectionState}`);
+        switch (pc.iceConnectionState) {
+            case "failed":
+                log.error("[rtc] [ice] failed establish connection, retry...");
+                pc.restartIce();
+                break;
         }
-        dataChannel.onclose = () => log.info('[rtc] the input channel has been closed');
-    }
-    connection.oniceconnectionstatechange = ice.onIceConnectionStateChange;
-    connection.onicegatheringstatechange = ice.onIceStateChange;
-    connection.onicecandidate = ice.onIcecandidate;
-    connection.ontrack = event => {
-        mediaStream.addTrack(event.track);
-    }
-};
+    };
 
-const stop = () => {
-    if (mediaStream) {
-        mediaStream.getTracks().forEach(t => {
-            t.stop();
-            mediaStream.removeTrack(t);
+    // add adds or buffers ICE candidates
+    // if wait is true
+    const add = (pc, candidate, wait = false) => {
+        if (wait) {
+            buf.push(candidate);
+            return;
+        }
+
+        const c = candidate
+            ? new RTCIceCandidate(candidate)
+            : END_OF_CANDIDATES;
+        pc.addIceCandidate(c).catch((e) => {
+            log.error("[rtc] [ice] add", e.name);
         });
-        mediaStream = null;
-    }
-    if (connection) {
-        connection.close();
-        connection = null;
-    }
-    if (dataChannel) {
-        dataChannel.close();
-        dataChannel = null;
-    }
-    candidates = [];
-    log.info('[rtc] WebRTC has been closed');
-}
+    };
 
-const ice = (() => {
-    const ICE_TIMEOUT = 2000;
-    let timeForIceGathering;
+    const flush = (pc) => {
+        if (buf.length === 0) return;
+        log.debug(`[rtc] [ice] buf (${buf.length}) flush`);
+        while (buf.length) {
+            add(pc, buf.shift());
+        }
+    };
 
     return {
-        onIcecandidate: data => {
-            if (!data.candidate) return;
-            log.info('[rtc] user candidate', data.candidate);
-            pub(WEBRTC_ICE_CANDIDATE_FOUND, {candidate: data.candidate})
-        },
-        onIceStateChange: event => {
-            switch (event.target.iceGatheringState) {
-                case 'gathering':
-                    log.info('[rtc] ice gathering');
-                    timeForIceGathering = setTimeout(() => {
-                        log.warn(`[rtc] ice gathering was aborted due to timeout ${ICE_TIMEOUT}ms`);
-                        // sendCandidates();
-                    }, ICE_TIMEOUT);
-                    break;
-                case 'complete':
-                    log.info('[rtc] ice gathering has been completed');
-                    if (timeForIceGathering) {
-                        clearTimeout(timeForIceGathering);
-                    }
-            }
-        },
-        onIceConnectionStateChange: () => {
-            log.info('[rtc] <- iceConnectionState', connection.iceConnectionState);
-            switch (connection.iceConnectionState) {
-                case 'connected':
-                    log.info('[rtc] connected...');
-                    connected = true;
-                    break;
-                case 'disconnected':
-                    log.info(`[rtc] disconnected... ` +
-                        `connection: ${connection.connectionState}, ice: ${connection.iceConnectionState}, ` +
-                        `gathering: ${connection.iceGatheringState}, signalling: ${connection.signalingState}`)
-                    connected = false;
-                    pub(WEBRTC_CONNECTION_CLOSED);
-                    break;
-                case 'failed':
-                    log.error('[rtc] failed establish connection, retry...');
-                    connected = false;
-                    connection.createOffer({iceRestart: true})
-                        .then(description => connection.setLocalDescription(description).catch(log.error))
-                        .catch(log.error);
-                    break;
-            }
-        }
+        onCandidate,
+        onCandidateError,
+        onGatheringStateChange,
+        onConnectionStateChange,
+        add,
+        flush,
+        close: () => (buf = []),
+    };
+})(() => signal);
+
+const isConnected = () => pc?.connectionState === "connected";
+
+// SDP needs some munging
+const mung = (sdp) =>
+    // Chrome bug https://bugs.chromium.org/p/chromium/issues/detail?id=818180 workaround
+    // force stereo params for Opus tracks (a=fmtp:111 ...)
+    sdp.replace(/(a=fmtp:111 .*)/g, "$1;stereo=1");
+
+const stub = () => {};
+
+const offer = async () => {
+    if (!pc || !caller) return;
+
+    try {
+        const offer = await pc.createOffer();
+        offer.sdp = mung(offer.sdp);
+        await pc.setLocalDescription(offer);
+        log.debug("[rtc] [sdp] local:", offer);
+        return offer;
+    } catch (e) {
+        log.error("[rtc] [sdp] local:", e);
     }
-})();
+};
 
 /**
  * WebRTC connection module.
  */
 export const webrtc = {
-    start,
-    setRemoteDescription: async (data, media) => {
-        log.debug('[rtc] remote SDP', data)
-        const offer = new RTCSessionDescription(JSON.parse(atob(data)));
-        await connection.setRemoteDescription(offer);
+    start: ({
+        iceServers = [],
+        media,
+        initiator = false,
+        onDataChannel = stub,
+        onConnect = stub,
+        onDisconnect = stub,
+        signalling,
+    } = {}) => {
+        let connectionTime;
 
-        const answer = await connection.createAnswer();
-        // Chrome bug https://bugs.chromium.org/p/chromium/issues/detail?id=818180 workaround
-        // force stereo params for Opus tracks (a=fmtp:111 ...)
-        answer.sdp = answer.sdp.replace(/(a=fmtp:111 .*)/g, '$1;stereo=1');
-        await connection.setLocalDescription(answer);
-        log.debug("[rtc] local SDP", answer)
+        iceServers = iceServers || [];
+        log.debug("[rtc] [config] ICE:", iceServers);
+        pc = new RTCPeerConnection({ iceServers });
 
-        isAnswered = true;
-        pub(WEBRTC_ICE_CANDIDATES_FLUSH);
-        pub(WEBRTC_SDP_ANSWER, {sdp: answer});
-        media.srcObject = mediaStream;
-    },
-    addCandidate: (data) => {
-        if (data === '') {
-            pub(WEBRTC_ICE_CANDIDATES_FLUSH);
+        // push datachannel
+        try {
+            let ch = pc.createDataChannel("data", {
+                negotiated: true,
+                id: 0,
+                ordered: false,
+                maxRetransmits: 0,
+            });
+            ch = onDataChannel ? onDataChannel(ch) : ch;
+            if (!ch) throw new Error("null channel");
+            channels.set(ch.label, ch);
+        } catch (e) {
+            log.error("[rtc] failed to create data channel", e);
+            return;
+        }
+
+        caller = initiator;
+        log.debug(`[rtc] ${caller ? "caller" : "callee"}`);
+
+        if (!signalling) {
+            log.error("[rtc] no signalling provided");
+            return;
+        }
+        signal = signalling;
+
+        stream = new MediaStream();
+        if (media) {
+            media.srcObject = stream;
         } else {
-            candidates.push(data);
+            log.warn("[rtc] no media provided");
+        }
+
+        pc.addTransceiver("video", { direction: "recvonly" });
+        pc.addTransceiver("audio", { direction: "recvonly" });
+
+        pc.ondatachannel = (/** @type RTCDataChannelEvent */ ev) => {
+            const chan = onDataChannel?.(ev.channel) ?? ev.channel;
+            channels.set(chan.label, chan);
+            log.debug(`[rtc] [chan] add: [${chan.label}]`);
+        };
+        pc.oniceconnectionstatechange = () => ice.onConnectionStateChange(pc);
+        pc.onicegatheringstatechange = ice.onGatheringStateChange;
+        pc.onicecandidate = ice.onCandidate;
+        pc.onicecandidateerror = ice.onCandidateError;
+        pc.onconnectionstatechange = () => {
+            log.debug(`[rtc] connection state: ${pc.connectionState}`);
+            switch (pc.connectionState) {
+                case "connected":
+                    onConnect();
+                    log.debug(
+                        `[rtc] connection time: ${performance.now() - connectionTime}ms`,
+                    );
+                    break;
+                case "failed":
+                case "closed":
+                    onDisconnect();
+                    break;
+            }
+        };
+        pc.onnegotiationneeded = () => {
+            log.debug("[rtc] negotiation");
+        };
+        pc.ontrack = (event) => stream.addTrack(event.track);
+        pc.onsignalingstatechange = () => {
+            log.debug(`[rtc] [sig] state: ${pc.signalingState}`);
+
+            if (pc.signalingState === "stable") {
+                ice.flush(pc);
+            }
+        };
+
+        connectionTime = performance.now();
+        if (initiator) {
+            offer().then((offer) => {
+                if (!offer) return;
+                signalling.init({ initiator, sdpOffer: offer });
+            });
+        } else {
+            signalling.init();
         }
     },
-    flushCandidates: () => {
-        if (isFlushing || !isAnswered) return;
-        isFlushing = true;
-        log.debug('[rtc] flushing candidates', candidates);
-        candidates.forEach(data => {
-            const candidate = new RTCIceCandidate(JSON.parse(atob(data)))
-            connection.addIceCandidate(candidate).catch(e => {
-                log.error('[rtc] candidate add failed', e.name);
-            });
-        });
-        isFlushing = false;
+    offer,
+    answer: async (/** @type {RTCSessionDescriptionInit} */ sdp) => {
+        log.debug("[rtc] [sdp] remote:", sdp);
+
+        if (!pc) return;
+
+        try {
+            await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            ice.flush(pc);
+        } catch (e) {
+            log.error("[rtc] [sdp] remote:", e);
+            return;
+        }
+
+        if (caller) return;
+
+        try {
+            const answer = await pc.createAnswer();
+            answer.sdp = mung(answer.sdp);
+            await pc.setLocalDescription(answer);
+            log.debug("[rtc] [sdp] local:", answer);
+            signal?.sendSdp(answer);
+        } catch (e) {
+            log.error("[rtc] [sdp] local:", e);
+        }
     },
-    input: (data) => dataChannel.send(data),
-    isConnected: () => connected,
-    isInputReady: () => inputReady,
+    candidate: (/** @type {RTCIceCandidateInit | string} */ candidate) => {
+        log.debug(`[rtc] [ice] remote`, candidate);
+        if (pc) {
+            const buffered =
+                !pc.remoteDescription || pc.signalingState !== "stable";
+            ice.add(pc, candidate, buffered);
+        }
+    },
+    send: (chan, data) => {
+        const ch = channels.get(chan);
+        if (ch?.readyState === "open") ch.send(data);
+    },
+    isConnected,
     stats: async () => {
-        if (!connected) return Promise.resolve();
-        return await connection.getStats()
+        if (!isConnected()) return Promise.resolve();
+        return await pc.getStats();
     },
-    stop,
-    set onData(fn) {
-        onData = fn
-    }
-}
+    stop: () => {
+        if (stream) {
+            while (stream.getTracks().length > 0) {
+                const t = stream.getTracks()[0];
+                t.stop();
+                stream.removeTrack(t);
+            }
+            stream = null;
+        }
+        if (pc) {
+            signal = null;
+            ice.close();
+            pc.oniceconnectionstatechange = null;
+            pc.onicegatheringstatechange = null;
+            pc.onicecandidate = null;
+            pc.onicecandidateerror = null;
+            pc.onconnectionstatechange = null;
+            pc.ondatachannel = null;
+            pc.ontrack = null;
+            pc.close();
+            pc = null;
+        }
+        for (const [, channel] of channels) {
+            channel.close();
+        }
+        channels.clear();
+        log.debug("[rtc] closed");
+    },
+};

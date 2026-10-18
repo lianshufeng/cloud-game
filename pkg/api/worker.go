@@ -1,30 +1,27 @@
 package api
 
 type (
-	ChangePlayerRequest[T Id] struct {
-		StatefulRoom[T]
+	ChangePlayerRequest struct {
+		StatefulRoom
 		Index int `json:"index"`
 	}
-	ChangePlayerResponse  int
-	GameQuitRequest[T Id] struct {
-		StatefulRoom[T]
-	}
-	LoadGameRequest[T Id] struct {
-		StatefulRoom[T]
-	}
-	LoadGameResponse      string
-	SaveGameRequest[T Id] struct {
-		StatefulRoom[T]
-	}
-	SaveGameResponse       string
-	StartGameRequest[T Id] struct {
-		StatefulRoom[T]
+	ChangePlayerResponse int
+	GameQuitRequest      StatefulRoom
+	LoadGameRequest      StatefulRoom
+	LoadGameResponse     string
+	ResetGameRequest     StatefulRoom
+	ResetGameResponse    string
+	SaveGameRequest      StatefulRoom
+	SaveGameResponse     string
+	StartGameRequest     struct {
+		StatefulRoom
 		Record      bool
 		RecordUser  string
-		Game        GameInfo `json:"game"`
-		PlayerIndex int      `json:"player_index"`
+		Game        string `json:"game"`
+		PlayerIndex int    `json:"player_index"`
 	}
 	GameInfo struct {
+		Alias  string `json:"alias"`
 		Base   string `json:"base"`
 		Name   string `json:"name"`
 		Path   string `json:"path"`
@@ -33,35 +30,46 @@ type (
 	}
 	StartGameResponse struct {
 		Room
-		AV     *AppVideoInfo `json:"av"`
-		Record bool
+		AV      *AppVideoInfo `json:"av"`
+		Record  bool          `json:"record"`
+		KbMouse bool          `json:"kb_mouse"`
 	}
-	RecordGameRequest[T Id] struct {
-		StatefulRoom[T]
+	RecordGameRequest struct {
+		StatefulRoom
 		Active bool   `json:"active"`
 		User   string `json:"user"`
 	}
-	RecordGameResponse            string
-	TerminateSessionRequest[T Id] struct {
-		Stateful[T]
+	RecordGameResponse      string
+	TerminateSessionRequest Stateful
+	WebrtcSignalRequest     struct {
+		Stateful
+		Sdp *string `json:"sdp,omitempty"`
+		Ice *string `json:"ice,omitempty"`
 	}
-	WebrtcAnswerRequest[T Id] struct {
-		Stateful[T]
-		Sdp string `json:"sdp"`
+	InitWebrtcStreamRequest struct {
+		// Stateful
+		Id        string `json:"id"`
+		Initiator bool   `json:"initiator"`
+		Sdp       string `json:"sdp,omitempty"`
 	}
-	WebrtcIceCandidateRequest[T Id] struct {
-		Stateful[T]
-		Candidate string `json:"candidate"` // Base64-encoded ICE candidate
-	}
-	WebrtcInitRequest[T Id] struct {
-		Stateful[T]
-	}
-	WebrtcInitResponse string
+	InitWebrtcStreamResponse string
 
 	AppVideoInfo struct {
-		W int     `json:"w"`
-		H int     `json:"h"`
-		S int     `json:"s"`
-		A float32 `json:"a"`
+		W    int     `json:"w"`
+		H    int     `json:"h"`
+		A    float32 `json:"a"`
+		S    int     `json:"s"`
+		SM   string  `json:"sm,omitempty"`
+		Flip bool    `json:"flip"`
+		Rot  uint    `json:"rot"`
+	}
+
+	LibGameListInfo struct {
+		T    int
+		List []GameInfo
+	}
+
+	PrevSessionInfo struct {
+		List []string
 	}
 )

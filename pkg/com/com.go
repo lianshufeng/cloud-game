@@ -2,23 +2,33 @@ package com
 
 import "github.com/giongto35/cloud-game/v3/pkg/logger"
 
-type NetClient[K comparable] interface {
+type stringer interface {
+	comparable
+	String() string
+}
+
+type NetClient[K stringer] interface {
 	Disconnect()
 	Id() K
 }
 
-type NetMap[K comparable, T NetClient[K]] struct{ Map[K, T] }
+type NetMap[K stringer, T NetClient[K]] struct{ Map[K, T] }
 
-func NewNetMap[K comparable, T NetClient[K]]() NetMap[K, T] {
+func NewNetMap[K stringer, T NetClient[K]]() NetMap[K, T] {
 	return NetMap[K, T]{Map: Map[K, T]{m: make(map[K]T, 10)}}
 }
 
 func (m *NetMap[K, T]) Add(client T) bool         { return m.Put(client.Id(), client) }
 func (m *NetMap[K, T]) Empty() bool               { return m.Map.Len() == 0 }
 func (m *NetMap[K, T]) Remove(client T)           { m.Map.Remove(client.Id()) }
-func (m *NetMap[K, T]) RemoveL(client T) int      { return m.Map.RemoveL(client.Id()) }
 func (m *NetMap[K, T]) Reset()                    { m.Map = Map[K, T]{m: make(map[K]T, 10)} }
 func (m *NetMap[K, T]) RemoveDisconnect(client T) { client.Disconnect(); m.Remove(client) }
+func (m *NetMap[K, T]) Find(id string) T {
+	v, _ := m.Map.FindBy(func(v T) bool {
+		return v.Id().String() == id
+	})
+	return v
+}
 
 type SocketClient[T ~uint8, P Packet[T], X any, P2 Packet2[X]] struct {
 	id   Uid
@@ -46,7 +56,9 @@ func NewConnection[T ~uint8, P Packet[T], X any, P2 Packet2[X]](conn *Connection
 func (c *SocketClient[T, P, _, _]) ProcessPackets(fn func(in P) error) chan struct{} {
 	c.rpc = NewRPC[T, P]()
 	c.rpc.Handler = func(p P) {
-		c.log.Debug().Str(logger.DirectionField, logger.MarkIn).Msgf("%v", p.GetType())
+		if c.log.GetLevel() <= logger.DebugLevel {
+			c.log.Debug().Str(logger.DirectionField, logger.MarkIn).Msgf("%v", p.GetType())
+		}
 		if err := fn(p); err != nil { // 3rd handler
 			c.log.Error().Err(err).Send()
 		}
@@ -54,6 +66,10 @@ func (c *SocketClient[T, P, _, _]) ProcessPackets(fn func(in P) error) chan stru
 	c.sock.conn.SetMessageHandler(c.handleMessage) // 1st handler
 	return c.sock.conn.Listen()
 }
+
+func (c *SocketClient[T, P, X, P2]) SetErrorHandler(h func(error)) { c.sock.conn.SetErrorHandler(h) }
+
+func (c *SocketClient[T, P, X, P2]) SetMaxMessageSize(s int64) { c.sock.conn.SetMaxMessageSize(s) }
 
 func (c *SocketClient[_, _, _, _]) handleMessage(message []byte, err error) {
 	if err != nil {
@@ -78,7 +94,9 @@ func (c *SocketClient[_, P, X, P2]) Route(in P, out P2) {
 
 // Send makes a blocking call.
 func (c *SocketClient[T, P, X, P2]) Send(t T, data any) ([]byte, error) {
-	c.log.Debug().Str(logger.DirectionField, logger.MarkOut).Msgf("ᵇ%v", t)
+	if c.log.GetLevel() <= logger.DebugLevel {
+		c.log.Debug().Str(logger.DirectionField, logger.MarkOut).Msgf("ᵇ%v", t)
+	}
 	rq := P2(new(X))
 	rq.SetType(uint8(t))
 	rq.SetPayload(data)
@@ -87,7 +105,9 @@ func (c *SocketClient[T, P, X, P2]) Send(t T, data any) ([]byte, error) {
 
 // Notify just sends a message and goes further.
 func (c *SocketClient[T, P, X, P2]) Notify(t T, data any) {
-	c.log.Debug().Str(logger.DirectionField, logger.MarkOut).Msgf("%v", t)
+	if c.log.GetLevel() <= logger.DebugLevel {
+		c.log.Debug().Str(logger.DirectionField, logger.MarkOut).Msgf("%v", t)
+	}
 	rq := P2(new(X))
 	rq.SetType(uint8(t))
 	rq.SetPayload(data)

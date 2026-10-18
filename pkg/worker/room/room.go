@@ -1,9 +1,12 @@
 package room
 
 import (
+	"iter"
 	"sync"
+	"time"
 
 	"github.com/giongto35/cloud-game/v3/pkg/worker/caged/app"
+	"github.com/giongto35/cloud-game/v3/pkg/worker/media"
 )
 
 type MediaPipe interface {
@@ -13,36 +16,33 @@ type MediaPipe interface {
 	Init() error
 	// Reinit initializes video and audio pipes with the new settings.
 	Reinit() error
-	// PushAudio pushes the 16bit PCM audio frames into an encoder.
-	// Because we need to fill the buffer, the SetAudioCb should be
-	// used in order to get the result.
-	PushAudio([]int16)
-	// ProcessVideo returns encoded video frame.
-	ProcessVideo(app.Video) []byte
-	// SetAudioCb sets a callback for encoded audio data with its frame duration (ns).
-	SetAudioCb(func(data []byte, duration int32))
+	// ProcessAudio pushes 16bit PCM audio frames into the encoder.
+	ProcessAudio([]byte, func([]byte, time.Duration))
+	// ProcessVideo pushes a video frame into the encoder.
+	ProcessVideo(media.Video, func([]byte, time.Duration))
 }
 
 type SessionManager[T Session] interface {
 	Add(T) bool
 	Empty() bool
 	Find(string) T
-	ForEach(func(T))
-	RemoveL(T) int
+	Remove(T)
 	// Reset used for proper cleanup of the resources if needed.
 	Reset()
+	Values() iter.Seq[T]
 }
 
 type Session interface {
 	Disconnect()
-	SendAudio([]byte, int32)
-	SendVideo([]byte, int32)
+	SendAudio([]byte, time.Duration)
+	SendVideo([]byte, time.Duration)
 	SendData([]byte)
 }
 
-type Uid interface {
-	Id() string
-}
+type SessionKey string
+
+func (s SessionKey) String() string { return string(s) }
+func (s SessionKey) Id() string     { return s.String() }
 
 type Room[T Session] struct {
 	app   app.App
@@ -50,38 +50,74 @@ type Room[T Session] struct {
 	media MediaPipe
 	users SessionManager[T]
 
+	peers   []T
+	peersMu sync.RWMutex
+
 	closed      bool
 	HandleClose func()
 }
 
 func NewRoom[T Session](id string, app app.App, um SessionManager[T], media MediaPipe) *Room[T] {
-	room := &Room[T]{id: id, app: app, users: um, media: media}
-	if app != nil && media != nil {
-		room.InitVideo()
-		room.InitAudio()
-	}
-	return room
+	return &Room[T]{id: id, app: app, users: um, media: media}
 }
 
-func (r *Room[T]) InitAudio() {
-	r.app.SetAudioCb(func(a app.Audio) { r.media.PushAudio(a.Data) })
-	r.media.SetAudioCb(func(d []byte, l int32) { r.users.ForEach(func(u T) { u.SendAudio(d, l) }) })
-}
-
-func (r *Room[T]) InitVideo() {
+func (r *Room[T]) InitMedia() {
+	r.app.SetAudioCb(func(a app.Audio) {
+		r.media.ProcessAudio(a.Data, r.sendAudio)
+	})
 	r.app.SetVideoCb(func(v app.Video) {
-		data := r.media.ProcessVideo(v)
-		r.users.ForEach(func(u T) { u.SendVideo(data, v.Duration) })
+		r.media.ProcessVideo(media.Video{
+			Frame:    media.RawFrame{Data: v.Frame.Data, W: v.Frame.W, H: v.Frame.H, Stride: v.Frame.Stride},
+			Duration: v.Duration,
+		}, r.sendVideo)
 	})
 }
 
+func (r *Room[T]) sendAudio(data []byte, dur time.Duration) {
+	r.peersMu.RLock()
+	peers := r.peers
+	r.peersMu.RUnlock()
+	for _, u := range peers {
+		u.SendAudio(data, dur)
+	}
+}
+
+func (r *Room[T]) sendVideo(data []byte, dur time.Duration) {
+	r.peersMu.RLock()
+	peers := r.peers
+	r.peersMu.RUnlock()
+	for _, u := range peers {
+		u.SendVideo(data, dur)
+	}
+}
+
 func (r *Room[T]) App() app.App         { return r.app }
-func (r *Room[T]) BindAppMedia()        { r.InitAudio(); r.InitVideo() }
 func (r *Room[T]) Id() string           { return r.id }
 func (r *Room[T]) SetApp(app app.App)   { r.app = app }
 func (r *Room[T]) SetMedia(m MediaPipe) { r.media = m }
 func (r *Room[T]) StartApp()            { r.app.Start() }
-func (r *Room[T]) Send(data []byte)     { r.users.ForEach(func(u T) { u.SendData(data) }) }
+func (r *Room[T]) Send(data []byte) {
+	r.peersMu.RLock()
+	peers := r.peers
+	r.peersMu.RUnlock()
+	for _, u := range peers {
+		u.SendData(data)
+	}
+}
+
+// SyncPeers rebuilds the cached peer slice from the session manager.
+// Must be called after any add/remove/reset of sessions.
+func (r *Room[T]) SyncPeers() {
+	if r.users == nil {
+		return
+	}
+	r.peersMu.Lock()
+	r.peers = r.peers[:0]
+	for u := range r.users.Values() {
+		r.peers = append(r.peers, u)
+	}
+	r.peersMu.Unlock()
+}
 
 func (r *Room[T]) Close() {
 	if r == nil || r.closed {
@@ -117,44 +153,76 @@ func (r *Router[T]) FindRoom(id string) *Room[T] {
 	return nil
 }
 
-func (r *Router[T]) Remove(user T) {
-	if left := r.users.RemoveL(user); left == 0 {
-		r.Close()
-		r.SetRoom(nil) // !to remove
+func (r *Router[T]) AddUser(user T) {
+	r.mu.Lock()
+	r.users.Add(user)
+	r.mu.Unlock()
+	if r.room != nil {
+		r.room.SyncPeers()
 	}
 }
-
-func (r *Router[T]) AddUser(user T)           { r.users.Add(user) }
-func (r *Router[T]) Close()                   { r.mu.Lock(); r.room.Close(); r.room = nil; r.mu.Unlock() }
-func (r *Router[T]) FindUser(uid Uid) T       { return r.users.Find(uid.Id()) }
-func (r *Router[T]) Room() *Room[T]           { r.mu.Lock(); defer r.mu.Unlock(); return r.room }
-func (r *Router[T]) SetRoom(room *Room[T])    { r.mu.Lock(); r.room = room; r.mu.Unlock() }
-func (r *Router[T]) HasRoom() bool            { r.mu.Lock(); defer r.mu.Unlock(); return r.room != nil }
+func (r *Router[T]) FindUser(uid string) T    { return r.users.Find(uid) }
 func (r *Router[T]) Users() SessionManager[T] { return r.users }
+func (r *Router[T]) Room() *Room[T]           { r.mu.Lock(); defer r.mu.Unlock(); return r.room }
+func (r *Router[T]) SetRoom(room *Room[T]) {
+	r.mu.Lock()
+	r.room = room
+	r.mu.Unlock()
+	if room != nil {
+		room.SyncPeers()
+	}
+}
+func (r *Router[T]) HasRoom() bool { r.mu.Lock(); defer r.mu.Unlock(); return r.room != nil }
+func (r *Router[T]) Close()        { r.mu.Lock(); r.close(); r.mu.Unlock() }
 func (r *Router[T]) Reset() {
 	r.mu.Lock()
+	r.close()
+	for u := range r.users.Values() {
+		u.Disconnect()
+	}
+	r.users.Reset()
+	if r.room != nil {
+		r.room.SyncPeers()
+	}
+	r.mu.Unlock()
+}
+func (r *Router[T]) Remove(user T) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.users.Remove(user)
+	if r.room != nil {
+		r.room.SyncPeers()
+	}
+	if r.users.Empty() {
+		r.close()
+	}
+}
+func (r *Router[T]) close() {
 	if r.room != nil {
 		r.room.Close()
 		r.room = nil
 	}
-	r.users.ForEach(func(u T) { u.Disconnect() })
-	r.users.Reset()
-	r.mu.Unlock()
 }
 
 type AppSession struct {
-	Uid
 	Session
-	uid string
+	uid SessionKey
 }
 
-func (p AppSession) Id() string { return p.uid }
+func (p AppSession) Id() SessionKey { return p.uid }
 
 type GameSession struct {
 	AppSession
 	Index int // track user Index (i.e. player 1,2,3,4 select)
 }
 
-func NewGameSession(id Uid, s Session) *GameSession {
-	return &GameSession{AppSession: AppSession{uid: id.Id(), Session: s}}
+func NewGameSession(id string, s Session) *GameSession {
+	return &GameSession{AppSession: AppSession{uid: SessionKey(id), Session: s}}
 }
+
+// Explicitly forward the embedded Session methods to work around a Go 1.27 linker bug:
+// promoted wrappers mis-link when called from generics.
+func (g GameSession) SendAudio(data []byte, dur time.Duration) { g.Session.SendAudio(data, dur) }
+func (g GameSession) SendVideo(data []byte, dur time.Duration) { g.Session.SendVideo(data, dur) }
+func (g GameSession) SendData(data []byte)                     { g.Session.SendData(data) }
+func (g GameSession) Disconnect()                              { g.Session.Disconnect() }

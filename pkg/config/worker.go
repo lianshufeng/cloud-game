@@ -14,6 +14,7 @@ import (
 type WorkerConfig struct {
 	Encoder   Encoder
 	Emulator  Emulator
+	Library   Library
 	Recording Recording
 	Storage   Storage
 	Worker    Worker
@@ -31,7 +32,6 @@ type Storage struct {
 
 type Worker struct {
 	Debug      bool
-	Library    Library
 	Monitoring Monitoring
 	Network    struct {
 		CoordinatorAddress string
@@ -48,26 +48,42 @@ type Worker struct {
 type Encoder struct {
 	Audio Audio
 	Video Video
+	List  map[string]CodecSettings
+}
+
+func (e Encoder) AudioSettings() *CodecSettings {
+	codec := strings.ToLower(e.Audio.Codec)
+	if cs, ok := e.List[codec]; ok {
+		return &cs
+	}
+	return nil
+}
+
+func (e Encoder) VideoSettings() (*CodecSettings, string) {
+	codec := strings.ToLower(e.Video.Codec)
+	if cs, ok := e.List[codec]; ok {
+		return &cs, codec
+	}
+	return nil, ""
 }
 
 type Audio struct {
-	Frame int
+	Codec     string
+	Frame     int
+	Resampler int
 }
 
 type Video struct {
-	Codec   string
-	Threads int
-	H264    struct {
-		Crf      uint8
-		LogLevel int32
-		Preset   string
-		Profile  string
-		Tune     string
-	}
-	Vpx struct {
-		Bitrate          uint
-		KeyframeInterval uint
-	}
+	Codec            string
+	KeyframeInterval int
+	Threads          int
+	Colorimetry      string
+}
+
+type CodecSettings struct {
+	Encoder string
+	Params  string
+	Caps    string
 }
 
 // allows custom config path
@@ -106,7 +122,7 @@ func (c *WorkerConfig) expandSpecialTags() {
 		if err != nil {
 			panic(fmt.Sprintf("couldn't read user home directory, %v", err))
 		}
-		*dir = strings.Replace(*dir, tag, userHomeDir, -1)
+		*dir = strings.ReplaceAll(*dir, tag, userHomeDir)
 		*dir = filepath.FromSlash(*dir)
 	}
 }

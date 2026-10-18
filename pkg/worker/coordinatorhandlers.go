@@ -1,7 +1,7 @@
 package worker
 
 import (
-	"encoding/base64"
+	"encoding/json"
 
 	"github.com/giongto35/cloud-game/v3/pkg/api"
 	"github.com/giongto35/cloud-game/v3/pkg/com"
@@ -11,13 +11,12 @@ import (
 	"github.com/giongto35/cloud-game/v3/pkg/worker/caged"
 	"github.com/giongto35/cloud-game/v3/pkg/worker/media"
 	"github.com/giongto35/cloud-game/v3/pkg/worker/room"
-	"github.com/goccy/go-json"
 )
 
 // buildConnQuery builds initial connection data query to a coordinator.
 func buildConnQuery(id com.Uid, conf config.Worker, address string) (string, error) {
 	addr := conf.GetPingAddr(address)
-	return toBase64Json(api.ConnectionRequest[com.Uid]{
+	return toJson(api.ConnectionRequest[com.Uid]{
 		Addr:    addr.Hostname(),
 		Id:      id,
 		IsHTTPS: conf.Server.Https,
@@ -28,23 +27,30 @@ func buildConnQuery(id com.Uid, conf config.Worker, address string) (string, err
 	})
 }
 
-func (c *coordinator) HandleWebrtcInit(rq api.WebrtcInitRequest[com.Uid], w *Worker, factory *webrtc.ApiFactory) api.Out {
-	peer := webrtc.New(c.log, factory)
-	localSDP, err := peer.NewCall(w.conf.Encoder.Video.Codec, "opus", func(data any) {
-		candidate, err := toBase64Json(data)
+func (c *coordinator) HandleInitWebrtcStream(rq api.InitWebrtcStreamRequest, w *Worker, factory *webrtc.ApiFactory) api.Out {
+	var err error
+	defer func() {
 		if err != nil {
-			c.log.Error().Err(err).Msgf("ICE candidate encode fail for [%v]", data)
-			return
+			c.log.Error().Err(err).Str("peer", rq.Id).Msg("")
 		}
-		c.IceCandidate(candidate, rq.Id)
-	})
-	if err != nil {
-		c.log.Error().Err(err).Msg("cannot create new webrtc session")
+	}()
+
+	peer := webrtc.New(c.log, factory)
+	codec := w.conf.Encoder.Video.Codec
+
+	if err = peer.NewConnection(codec, func(ice *string) { c.IceCandidate(*ice, rq.Id) }); err != nil {
 		return api.EmptyPacket
 	}
-	sdp, err := toBase64Json(localSDP)
+
+	if rq.Initiator {
+		if err = peer.HandleSignal(nil, &rq.Sdp); err != nil {
+			return api.EmptyPacket
+		}
+	}
+
+	var sdp string
+	sdp, err = peer.OfferAnswer(!rq.Initiator)
 	if err != nil {
-		c.log.Error().Err(err).Msgf("SDP encode fail fro [%v]", localSDP)
 		return api.EmptyPacket
 	}
 
@@ -55,23 +61,20 @@ func (c *coordinator) HandleWebrtcInit(rq api.WebrtcInitRequest[com.Uid], w *Wor
 	return api.Out{Payload: sdp}
 }
 
-func (c *coordinator) HandleWebrtcAnswer(rq api.WebrtcAnswerRequest[com.Uid], w *Worker) {
-	if user := w.router.FindUser(rq.Id); user != nil {
-		if err := room.WithWebRTC(user.Session).SetRemoteSDP(rq.Sdp, fromBase64Json); err != nil {
-			c.log.Error().Err(err).Msgf("cannot set remote SDP of client [%v]", rq.Id)
+func (c *coordinator) HandleWebrtcSignal(rq api.WebrtcSignalRequest, w *Worker) {
+	user := w.router.FindUser(rq.Id)
+	if user == nil {
+		return
+	}
+
+	if webrtc := room.WithWebRTC(user.Session); webrtc != nil {
+		if err := webrtc.HandleSignal(rq.Ice, rq.Sdp); err != nil {
+			c.log.Error().Err(err).Msgf("cannot handle the signal from [%v]", rq.Id)
 		}
 	}
 }
 
-func (c *coordinator) HandleWebrtcIceCandidate(rs api.WebrtcIceCandidateRequest[com.Uid], w *Worker) {
-	if user := w.router.FindUser(rs.Id); user != nil {
-		if err := room.WithWebRTC(user.Session).AddCandidate(rs.Candidate, fromBase64Json); err != nil {
-			c.log.Error().Err(err).Msgf("cannot add ICE candidate of the client [%v]", rs.Id)
-		}
-	}
-}
-
-func (c *coordinator) HandleGameStart(rq api.StartGameRequest[com.Uid], w *Worker) api.Out {
+func (c *coordinator) HandleGameStart(rq api.StartGameRequest, w *Worker) api.Out {
 	user := w.router.FindUser(rq.Id)
 	if user == nil {
 		c.log.Error().Msgf("no user [%v]", rq.Id)
@@ -79,16 +82,35 @@ func (c *coordinator) HandleGameStart(rq api.StartGameRequest[com.Uid], w *Worke
 	}
 	user.Index = rq.PlayerIndex
 
-	r := w.router.FindRoom(rq.Room.Rid)
+	r := w.router.FindRoom(rq.Rid)
+
+	// +injects game data into the original game request
+	// the name of the game either in the `room id` field or
+	// it's in the initial request
+	gameName := rq.Game
+	if rq.Rid != "" {
+		name := w.launcher.ExtractAppNameFromUrl(rq.Rid)
+		if name == "" {
+			c.log.Warn().Msg("couldn't decode game name from the room id")
+			return api.EmptyPacket
+		}
+		gameName = name
+	}
+
+	gameInfo, err := w.launcher.FindAppByName(gameName)
+	if err != nil {
+		c.log.Error().Err(err).Send()
+		return api.EmptyPacket
+	}
 
 	if r == nil { // new room
-		uid := rq.Room.Rid
+		uid := rq.Rid
 		if uid == "" {
-			uid = games.GenerateRoomID(rq.Game.Name)
+			uid = games.GenerateRoomID(gameName)
 		}
-		game := games.GameMetadata(rq.Game)
+		game := games.GameMetadata(gameInfo)
 
-		r = room.NewRoom[*room.GameSession](uid, nil, w.router.Users(), nil)
+		r = room.NewRoom(uid, nil, w.router.Users(), nil)
 		r.HandleClose = func() {
 			c.CloseRoom(uid)
 			c.log.Debug().Msgf("room close request %v sent", uid)
@@ -108,38 +130,41 @@ func (c *coordinator) HandleGameStart(rq api.StartGameRequest[com.Uid], w *Worke
 		app.SetSessionId(uid)
 		app.SetSaveOnClose(true)
 		app.EnableCloudStorage(uid, w.storage)
-		app.EnableRecording(rq.Record, rq.RecordUser, rq.Game.Name)
+		app.EnableRecording(rq.Record, rq.RecordUser, gameName)
 
 		r.SetApp(app)
 
-		m := media.NewWebRtcMediaPipe(w.conf.Encoder.Audio, w.conf.Encoder.Video, w.log)
+		m := media.NewGstreamer(w.conf.Encoder, w.log)
 
 		// recreate the video encoder
 		app.VideoChangeCb(func() {
 			app.ViewportRecalculate()
 			m.VideoW, m.VideoH = app.ViewportSize()
-			m.VideoScale = app.Scale()
+			m.VideoScale, m.ScaleMethod = app.Scale()
 
-			if m.IsInitialized() {
-				if err := m.Reinit(); err != nil {
-					c.log.Error().Err(err).Msgf("reinit fail")
-				}
+			if err := m.Reinit(); err != nil {
+				c.log.Error().Err(err).Msgf("reinit fail")
 			}
 
-			data, err := api.Wrap(api.Out{T: uint8(api.AppVideoChange), Payload: api.AppVideoInfo{
-				W: m.VideoW,
-				H: m.VideoH,
-				A: app.AspectRatio(),
-				S: int(app.Scale()),
-			}})
+			data, err := api.Wrap(api.Out{
+				T: uint8(api.AppVideoChange),
+				Payload: api.AppVideoInfo{
+					W:    m.VideoW,
+					H:    m.VideoH,
+					A:    app.AspectRatio(),
+					S:    int(m.VideoScale),
+					SM:   m.ScaleMethod,
+					Flip: app.Flipped(),
+					Rot:  app.Rotation(),
+				}})
 			if err != nil {
 				c.log.Error().Err(err).Msgf("wrap")
 			}
 			r.Send(data)
 		})
 
-		w.log.Info().Msgf("Starting the game: %v", rq.Game.Name)
-		if err := app.Load(game, w.conf.Worker.Library.BasePath); err != nil {
+		w.log.Info().Msgf("Starting the game: %v", gameName)
+		if err := app.Load(game, w.conf.Library.BasePath); err != nil {
 			c.log.Error().Err(err).Msgf("couldn't load the game %v", game)
 			r.Close()
 			w.router.SetRoom(nil)
@@ -147,9 +172,15 @@ func (c *coordinator) HandleGameStart(rq api.StartGameRequest[com.Uid], w *Worke
 		}
 
 		m.AudioSrcHz = app.AudioSampleRate()
-		m.AudioFrame = w.conf.Encoder.Audio.Frame
 		m.VideoW, m.VideoH = app.ViewportSize()
-		m.VideoScale = app.Scale()
+		m.VideoScale, m.ScaleMethod = app.Scale()
+		coreConf := w.conf.Emulator.GetLibretroCoreConfig(game.System)
+		m.MaxThreads = coreConf.MaxThreads
+		m.VideoFPS = app.FPS()
+		m.VideoVFR = coreConf.VFR
+
+		m.SetPixFmt(app.PixFormat())
+		m.SetRot(app.Rotation())
 
 		r.SetMedia(m)
 
@@ -159,48 +190,69 @@ func (c *coordinator) HandleGameStart(rq api.StartGameRequest[com.Uid], w *Worke
 			w.router.SetRoom(nil)
 			return api.EmptyPacket
 		}
-		if app.Flipped() {
-			m.SetVideoFlip(true)
-		}
-		m.SetPixFmt(app.PixFormat())
-		m.SetRot(app.Rotation())
 
-		r.BindAppMedia()
+		r.InitMedia()
 		r.StartApp()
 	}
 
-	c.log.Debug().Msg("Start session input poll")
-	room.WithWebRTC(user.Session).OnMessage = func(data []byte) { r.App().SendControl(user.Index, data) }
+	needsKbMouse := r.App().KbMouseSupport()
+
+	s := room.WithWebRTC(user.Session)
+	s.OnMessage(func(data []byte) { r.App().Input(user.Index, byte(caged.RetroPad), data) })
+	if needsKbMouse {
+		_, _ = s.Channel("keyboard", nil, func(data []byte) { r.App().Input(user.Index, byte(caged.Keyboard), data) })
+		_, _ = s.Channel("mouse", nil, func(data []byte) { r.App().Input(user.Index, byte(caged.Mouse), data) })
+	}
 
 	c.RegisterRoom(r.Id())
 
-	response := api.StartGameResponse{Room: api.Room{Rid: r.Id()}, Record: w.conf.Recording.Enabled}
+	response := api.StartGameResponse{
+		Room:    api.Room{Rid: r.Id()},
+		Record:  w.conf.Recording.Enabled,
+		KbMouse: needsKbMouse,
+	}
+
 	if r.App().AspectEnabled() {
 		ww, hh := r.App().ViewportSize()
-		response.AV = &api.AppVideoInfo{W: ww, H: hh, A: r.App().AspectRatio(), S: int(r.App().Scale())}
+		scale, scaleM := r.App().Scale()
+		response.AV = &api.AppVideoInfo{
+			W:    ww,
+			H:    hh,
+			A:    r.App().AspectRatio(),
+			S:    int(scale),
+			SM:   scaleM,
+			Flip: r.App().Flipped(),
+			Rot:  r.App().Rotation(),
+		}
 	}
 
 	return api.Out{Payload: response}
 }
 
 // HandleTerminateSession handles cases when a user has been disconnected from the websocket of coordinator.
-func (c *coordinator) HandleTerminateSession(rq api.TerminateSessionRequest[com.Uid], w *Worker) {
+func (c *coordinator) HandleTerminateSession(rq api.TerminateSessionRequest, w *Worker) {
 	if user := w.router.FindUser(rq.Id); user != nil {
 		w.router.Remove(user)
-		c.log.Debug().Msgf(">>> users: %v", w.router.Users())
 		user.Disconnect()
 	}
 }
 
 // HandleQuitGame handles cases when a user manually exits the game.
-func (c *coordinator) HandleQuitGame(rq api.GameQuitRequest[com.Uid], w *Worker) {
+func (c *coordinator) HandleQuitGame(rq api.GameQuitRequest, w *Worker) {
 	if user := w.router.FindUser(rq.Id); user != nil {
 		w.router.Remove(user)
-		c.log.Debug().Msgf(">>> users: %v", w.router.Users())
 	}
 }
 
-func (c *coordinator) HandleSaveGame(rq api.SaveGameRequest[com.Uid], w *Worker) api.Out {
+func (c *coordinator) HandleResetGame(rq api.ResetGameRequest, w *Worker) api.Out {
+	if r := w.router.FindRoom(rq.Rid); r != nil {
+		room.WithEmulator(r.App()).Reset()
+		return api.OkPacket
+	}
+	return api.ErrPacket
+}
+
+func (c *coordinator) HandleSaveGame(rq api.SaveGameRequest, w *Worker) api.Out {
 	r := w.router.FindRoom(rq.Rid)
 	if r == nil {
 		return api.ErrPacket
@@ -212,7 +264,7 @@ func (c *coordinator) HandleSaveGame(rq api.SaveGameRequest[com.Uid], w *Worker)
 	return api.OkPacket
 }
 
-func (c *coordinator) HandleLoadGame(rq api.LoadGameRequest[com.Uid], w *Worker) api.Out {
+func (c *coordinator) HandleLoadGame(rq api.LoadGameRequest, w *Worker) api.Out {
 	r := w.router.FindRoom(rq.Rid)
 	if r == nil {
 		return api.ErrPacket
@@ -224,7 +276,7 @@ func (c *coordinator) HandleLoadGame(rq api.LoadGameRequest[com.Uid], w *Worker)
 	return api.OkPacket
 }
 
-func (c *coordinator) HandleChangePlayer(rq api.ChangePlayerRequest[com.Uid], w *Worker) api.Out {
+func (c *coordinator) HandleChangePlayer(rq api.ChangePlayerRequest, w *Worker) api.Out {
 	user := w.router.FindUser(rq.Id)
 	if user == nil || w.router.FindRoom(rq.Rid) == nil {
 		return api.Out{Payload: -1} // semi-predicates
@@ -234,7 +286,7 @@ func (c *coordinator) HandleChangePlayer(rq api.ChangePlayerRequest[com.Uid], w 
 	return api.Out{Payload: rq.Index}
 }
 
-func (c *coordinator) HandleRecordGame(rq api.RecordGameRequest[com.Uid], w *Worker) api.Out {
+func (c *coordinator) HandleRecordGame(rq api.RecordGameRequest, w *Worker) api.Out {
 	if !w.conf.Recording.Enabled {
 		return api.ErrPacket
 	}
@@ -246,21 +298,7 @@ func (c *coordinator) HandleRecordGame(rq api.RecordGameRequest[com.Uid], w *Wor
 	return api.OkPacket
 }
 
-// fromBase64Json decodes data from a URL-encoded Base64+JSON string.
-func fromBase64Json(data string, obj any) error {
-	b, err := base64.URLEncoding.DecodeString(data)
-	if err != nil {
-		return err
-	}
-	err = json.Unmarshal(b, obj)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// toBase64Json encodes data to a URL-encoded Base64+JSON string.
-func toBase64Json(data any) (string, error) {
+func toJson(data any) (string, error) {
 	if data == nil {
 		return "", nil
 	}
@@ -268,5 +306,5 @@ func toBase64Json(data any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return base64.URLEncoding.EncodeToString(b), nil
+	return string(b), nil
 }

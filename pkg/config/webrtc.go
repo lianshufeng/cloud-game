@@ -8,10 +8,13 @@ type Webrtc struct {
 		Min uint16
 		Max uint16
 	}
-	IceIpMap   string
-	IceLite    bool
-	SinglePort int
-	LogLevel   int
+	IceIpMap                 string
+	IceLite                  bool
+	IpFilter                 []string
+	IpFilterRemote           []string
+	IncludeLoopbackCandidate bool
+	SinglePort               int
+	LogLevel                 int
 }
 
 type IceServer struct {

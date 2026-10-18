@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/giongto35/cloud-game/v3/pkg/logger"
 	"github.com/giongto35/cloud-game/v3/pkg/os"
 	"github.com/giongto35/cloud-game/v3/pkg/worker/caged/app"
+	"github.com/giongto35/cloud-game/v3/pkg/worker/caged/libretro/graphics"
 	"github.com/giongto35/cloud-game/v3/pkg/worker/caged/libretro/nanoarch"
 )
 
@@ -22,7 +25,7 @@ type Emulator interface {
 	SetDataCb(func([]byte))
 	LoadCore(name string)
 	LoadGame(path string) error
-	FPS() int
+	FPS() float64
 	Flipped() bool
 	Rotation() uint
 	PixFormat() uint32
@@ -44,15 +47,17 @@ type Emulator interface {
 	// Close will be called when the game is done
 	Close()
 	// Input passes input to the emulator
-	Input(player int, data []byte)
-	// Scale returns set video scale factor
-	Scale() float64
+	Input(player int, device byte, data []byte)
+	// Scale returns set video scale factor and method
+	Scale() (float64, string)
+	Reset()
 }
 
 type Frontend struct {
 	conf    config.Emulator
 	done    chan struct{}
-	input   InputState
+	doneEvt chan struct{} // closed when Start() fully exits
+	closed  atomic.Bool
 	log     *logger.Logger
 	nano    *nanoarch.Nanoarch
 	onAudio func(app.Audio)
@@ -60,31 +65,35 @@ type Frontend struct {
 	onVideo func(app.Video)
 	storage Storage
 	scale   float64
+	scaleM  string
+	isGL    bool
 	th      int // draw threads
 	vw, vh  int // out frame size
+
+	// directives
+
+	// SpinBatch batches nanotime checks in the spin loop.
+	// Higher values = check every N iterations, reducing syscall overhead.
+	SpinBatch int
+
+	// skipVideo used when new frame was too late
+	skipVideo bool
 
 	mu  sync.Mutex
 	mui sync.Mutex
 
 	DisableCanvasPool bool
 	SaveOnClose       bool
+	UniqueSaveDir     bool
+	SaveStateFs       string
 }
 
-// InputState stores full controller state.
-// It consists of:
-//   - uint16 button values
-//   - int16 analog stick values
-type (
-	InputState [maxPort]State
-	State      struct {
-		keys uint32
-		axes [dpadAxes]int32
-	}
-)
+type Device byte
 
 const (
-	maxPort  = 4
-	dpadAxes = 4
+	RetroPad = Device(nanoarch.RetroPad)
+	Keyboard = Device(nanoarch.Keyboard)
+	Mouse    = Device(nanoarch.Mouse)
 )
 
 var (
@@ -127,15 +136,15 @@ func NewFrontend(conf config.Emulator, log *logger.Logger) (*Frontend, error) {
 
 	// set global link to the Libretro
 	f := &Frontend{
-		conf:    conf,
-		done:    make(chan struct{}),
-		input:   NewGameSessionInput(),
-		log:     log,
-		onAudio: noAudio,
-		onData:  noData,
-		onVideo: noVideo,
-		storage: store,
-		th:      conf.Threads,
+		conf:      conf,
+		done:      make(chan struct{}),
+		log:       log,
+		onAudio:   noAudio,
+		onData:    noData,
+		onVideo:   noVideo,
+		storage:   store,
+		th:        conf.Threads,
+		SpinBatch: 2048, // ~ 3GHz 3M / 2048 calls
 	}
 	f.linkNano(nano)
 
@@ -150,6 +159,14 @@ func NewFrontend(conf config.Emulator, log *logger.Logger) (*Frontend, error) {
 
 func (f *Frontend) LoadCore(emu string) {
 	conf := f.conf.GetLibretroCoreConfig(emu)
+
+	libExt := ""
+	if ar, err := f.conf.Libretro.Cores.Repo.Guess(); err == nil {
+		libExt = ar.Ext
+	} else {
+		f.log.Warn().Err(err).Msg("system arch guesser failed")
+	}
+
 	meta := nanoarch.Metadata{
 		AutoGlContext:   conf.AutoGlContext,
 		FrameDup:        f.conf.Libretro.Dup,
@@ -162,14 +179,25 @@ func (f *Frontend) LoadCore(emu string) {
 		Options4rom:     conf.Options4rom,
 		UsesLibCo:       conf.UsesLibCo,
 		CoreAspectRatio: conf.CoreAspectRatio,
+		KbMouseSupport:  conf.KbMouseSupport,
+		LibExt:          libExt,
 	}
 	f.mu.Lock()
+	f.SaveStateFs = conf.SaveStateFs
+	if conf.UniqueSaveDir {
+		f.UniqueSaveDir = true
+		f.nano.SetSaveDirSuffix(f.storage.MainPath())
+		f.log.Debug().Msgf("Using unique dir for saves: %v", f.storage.MainPath())
+	}
 	scale := 1.0
 	if conf.Scale > 1 {
 		scale = conf.Scale
 		f.log.Debug().Msgf("Scale: x%v", scale)
 	}
+	f.storage.SetNonBlocking(conf.NonBlockingSave)
 	f.scale = scale
+	f.scaleM = conf.ScaleMethod
+	f.isGL = conf.IsGlAllowed
 	f.nano.CoreLoad(meta)
 	f.mu.Unlock()
 }
@@ -180,14 +208,18 @@ func (f *Frontend) handleAudio(audio unsafe.Pointer, samples int) {
 		fr = new(app.Audio)
 	}
 	// !to look if we need a copy
-	fr.Data = unsafe.Slice((*int16)(audio), samples)
+	fr.Data = unsafe.Slice((*byte)(audio), samples<<1)
 	// due to audio buffering for opus fixed frames and const duration up in the hierarchy,
 	// we skip Duration here
 	f.onAudio(*fr)
 	audioPool.Put(fr)
 }
 
-func (f *Frontend) handleVideo(data []byte, delta int32, fi nanoarch.FrameInfo) {
+func (f *Frontend) handleVideo(data []byte, delta time.Duration, fi nanoarch.FrameInfo) {
+	if f.conf.SkipLateFrames && f.skipVideo {
+		return
+	}
+
 	fr, _ := videoPool.Get().(*app.Video)
 	if fr == nil {
 		fr = new(app.Video)
@@ -227,8 +259,6 @@ func (f *Frontend) linkNano(nano *nanoarch.Nanoarch) {
 	}
 	f.nano.WaitReady() // start only when nano is available
 
-	f.nano.OnKeyPress = f.input.isKeyPressed
-	f.nano.OnDpad = f.input.isDpadTouched
 	f.nano.OnVideo = f.handleVideo
 	f.nano.OnAudio = f.handleAudio
 	f.nano.OnDup = f.handleDup
@@ -250,9 +280,16 @@ func (f *Frontend) Start() {
 		return
 	}
 
+	if f.isGL {
+		// don't jump between threads
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
+
 	f.mui.Lock()
 	f.done = make(chan struct{})
-	f.nano.LastFrameTime = time.Now().UnixNano()
+	f.doneEvt = make(chan struct{})
+	f.nano.LastFrameTime = time.Now()
 
 	defer func() {
 		// Save game on quit if it was saved before (shared or click-saved).
@@ -262,9 +299,10 @@ func (f *Frontend) Start() {
 				f.log.Error().Err(err).Msg("save on quit failed")
 			}
 		}
+		f.mui.Unlock()
 		f.Shutdown()
+		close(f.doneEvt)
 	}()
-	defer f.mui.Unlock()
 
 	if f.HasSave() {
 		// advance 1 frame for Mupen, DOSBox save states
@@ -275,41 +313,110 @@ func (f *Frontend) Start() {
 		}
 	}
 
-	ticker := time.NewTicker(time.Second / time.Duration(f.nano.VideoFramerate()))
-	defer ticker.Stop()
-
 	if f.conf.AutosaveSec > 0 {
 		// !to sync both for loops, can crash if the emulator starts later
 		go f.autosave(f.conf.AutosaveSec)
 	}
 
+	// The main loop of Libretro
+
+	targetFrameTimeNs := int64(float64(time.Second) / f.nano.VideoFramerate())
+
+	// stop sleeping and start spinning in the remaining 1ms
+	const spinThresholdNs = int64(1 * time.Millisecond)
+
+	// how many frames will be considered not normal
+	const lateFramesThreshold = 3
+
+	batch := max(f.SpinBatch, 1)
+
+	lastFrameStart := os.Nanotime()
+
 	for {
 		select {
-		case <-ticker.C:
-			f.Tick()
 		case <-f.done:
 			return
+		default:
+			f.nano.NotifyFrameTime(targetFrameTimeNs / 1000)
+
+			f.Tick()
+
+			now := os.Nanotime()
+			elapsed := now - lastFrameStart
+			sleepTimeNs := targetFrameTimeNs - elapsed
+			deadline := lastFrameStart + targetFrameTimeNs
+
+			if sleepTimeNs > 0 {
+				// SLEEP
+				// if we have plenty of time, sleep to save CPU and
+				// wake up slightly before the target time
+				if sleepTimeNs > spinThresholdNs {
+					time.Sleep(time.Duration(sleepTimeNs - spinThresholdNs))
+				}
+
+				// SPIN
+				// if we are close to the target,
+				// burn CPU and check the clock with ns resolution.
+				// SpinBatch batches the time check to reduce
+				// overhead while keeping sub-us precision.
+				for {
+					for range batch - 1 {
+					}
+					if os.Nanotime() >= deadline {
+						break
+					}
+				}
+				f.skipVideo = false
+			} else {
+				// lagging behind the target framerate so we don't sleep
+				if f.conf.LogDroppedFrames {
+					// !to make some stats counter instead
+					f.log.Debug().Msgf("[] Frame drop: %v", time.Duration(elapsed))
+				}
+				f.skipVideo = true
+			}
+
+			// timer reset
+			//
+			// adding targetFrameTime to the previous start
+			// prevents drift, if one frame was late,
+			// we try to catch up in the next frame
+			lastFrameStart = lastFrameStart + targetFrameTimeNs
+
+			// if execution was paused or heavily delayed,
+			// reset lastFrameStart so we don't try to run
+			// a bunch of frames instantly to catch up
+			if os.Nanotime()-lastFrameStart > targetFrameTimeNs*lateFramesThreshold {
+				lastFrameStart = os.Nanotime()
+			}
 		}
 	}
 }
 
+func (f *Frontend) LoadGame(path string) error {
+	if f.UniqueSaveDir {
+		f.copyFsMaybe(path)
+	}
+	return f.nano.LoadGame(path)
+}
+
 func (f *Frontend) AspectRatio() float32          { return f.nano.AspectRatio() }
 func (f *Frontend) AudioSampleRate() int          { return f.nano.AudioSampleRate() }
-func (f *Frontend) FPS() int                      { return f.nano.VideoFramerate() }
+func (f *Frontend) FPS() float64                  { return f.nano.VideoFramerate() }
 func (f *Frontend) Flipped() bool                 { return f.nano.IsGL() }
 func (f *Frontend) FrameSize() (int, int)         { return f.nano.BaseWidth(), f.nano.BaseHeight() }
 func (f *Frontend) HasSave() bool                 { return os.Exists(f.HashPath()) }
 func (f *Frontend) HashPath() string              { return f.storage.GetSavePath() }
-func (f *Frontend) Input(player int, data []byte) { f.input.setInput(player, data) }
 func (f *Frontend) IsPortrait() bool              { return f.nano.IsPortrait() }
-func (f *Frontend) LoadGame(path string) error    { return f.nano.LoadGame(path) }
+func (f *Frontend) KbMouseSupport() bool          { return f.nano.KbMouseSupport() }
 func (f *Frontend) PixFormat() uint32             { return f.nano.Video.PixFmt.C }
+func (f *Frontend) Reset()                        { f.mu.Lock(); defer f.mu.Unlock(); f.nano.Reset() }
 func (f *Frontend) RestoreGameState() error       { return f.Load() }
 func (f *Frontend) Rotation() uint                { return f.nano.Rot }
 func (f *Frontend) SRAMPath() string              { return f.storage.GetSRAMPath() }
 func (f *Frontend) SaveGameState() error          { return f.Save() }
 func (f *Frontend) SaveStateName() string         { return filepath.Base(f.HashPath()) }
-func (f *Frontend) Scale() float64                { return f.scale }
+func (f *Frontend) Scale() (float64, string)      { return f.scale, f.scaleM }
 func (f *Frontend) SetAudioCb(cb func(app.Audio)) { f.onAudio = cb }
 func (f *Frontend) SetSessionId(name string)      { f.storage.SetMainSaveName(name) }
 func (f *Frontend) SetDataCb(cb func([]byte))     { f.onData = cb }
@@ -317,6 +424,17 @@ func (f *Frontend) SetVideoCb(ff func(app.Video)) { f.onVideo = ff }
 func (f *Frontend) Tick()                         { f.mu.Lock(); f.nano.Run(); f.mu.Unlock() }
 func (f *Frontend) ViewportRecalculate()          { f.mu.Lock(); f.vw, f.vh = f.ViewportCalc(); f.mu.Unlock() }
 func (f *Frontend) ViewportSize() (int, int)      { return f.vw, f.vh }
+
+func (f *Frontend) Input(port int, device byte, data []byte) {
+	switch Device(device) {
+	case RetroPad:
+		f.nano.InputRetropad(port, data)
+	case Keyboard:
+		f.nano.InputKeyboard(port, data)
+	case Mouse:
+		f.nano.InputMouse(port, data)
+	}
+}
 
 func (f *Frontend) ViewportCalc() (nw int, nh int) {
 	w, h := f.FrameSize()
@@ -333,10 +451,29 @@ func (f *Frontend) ViewportCalc() (nw int, nh int) {
 
 func (f *Frontend) Close() {
 	f.log.Debug().Msgf("frontend close")
+	if f.closed.Swap(true) {
+		return
+	}
 	close(f.done)
 
 	f.mui.Lock()
 	f.nano.Close()
+	f.mui.Unlock()
+
+	if f.doneEvt != nil {
+		<-f.doneEvt
+	}
+
+	f.mui.Lock()
+	if f.UniqueSaveDir && !f.HasSave() {
+		if err := f.nano.DeleteSaveDir(); err != nil {
+			f.log.Error().Msgf("couldn't delete save dir: %v", err)
+		}
+	}
+
+	f.UniqueSaveDir = false
+	f.SaveStateFs = ""
+
 	f.mui.Unlock()
 	f.log.Debug().Msgf("frontend closed")
 }
@@ -387,6 +524,10 @@ func (f *Frontend) Load() error {
 	return nil
 }
 
+func (f *Frontend) IsSupported() error {
+	return graphics.RGFWTryInit()
+}
+
 func (f *Frontend) autosave(periodSec int) {
 	f.log.Info().Msgf("Autosave every [%vs]", periodSec)
 	ticker := time.NewTicker(time.Duration(periodSec) * time.Second)
@@ -409,23 +550,31 @@ func (f *Frontend) autosave(periodSec int) {
 	}
 }
 
-func NewGameSessionInput() InputState { return [maxPort]State{} }
-
-// setInput sets input state for some player in a game session.
-func (s *InputState) setInput(player int, data []byte) {
-	atomic.StoreUint32(&s[player].keys, uint32(uint16(data[1])<<8+uint16(data[0])))
-	for i, axes := 0, len(data); i < dpadAxes && i<<1+3 < axes; i++ {
-		axis := i<<1 + 2
-		atomic.StoreInt32(&s[player].axes[i], int32(data[axis+1])<<8+int32(data[axis]))
+func (f *Frontend) copyFsMaybe(path string) {
+	if f.SaveStateFs == "" {
+		return
 	}
-}
 
-// isKeyPressed checks if some button is pressed by any player.
-func (s *InputState) isKeyPressed(port uint, key int) int {
-	return int((atomic.LoadUint32(&s[port].keys) >> uint(key)) & 1)
-}
+	fileName := f.SaveStateFs
+	hasPlaceholder := strings.HasPrefix(f.SaveStateFs, "*")
+	if hasPlaceholder {
+		game := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		fileName = strings.Replace(f.SaveStateFs, "*", game, 1)
+	}
 
-// isDpadTouched checks if D-pad is used by any player.
-func (s *InputState) isDpadTouched(port uint, axis uint) (shift int16) {
-	return int16(atomic.LoadInt32(&s[port].axes[axis]))
+	fullPath := filepath.Join(f.nano.SaveDir(), fileName)
+
+	if os.Exists(fullPath) {
+		return
+	}
+
+	storePath := filepath.Dir(path)
+	fsPath := filepath.Join(storePath, fileName)
+	if os.Exists(fsPath) {
+		if err := os.CopyFile(fsPath, fullPath); err != nil {
+			f.log.Error().Err(err).Msgf("fs copy fail")
+		} else {
+			f.log.Debug().Msgf("copied fs %v to %v", fsPath, fullPath)
+		}
+	}
 }

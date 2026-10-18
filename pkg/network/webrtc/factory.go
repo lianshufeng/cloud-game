@@ -7,7 +7,7 @@ import (
 	"github.com/giongto35/cloud-game/v3/pkg/config"
 	"github.com/giongto35/cloud-game/v3/pkg/logger"
 	"github.com/giongto35/cloud-game/v3/pkg/network/socket"
-	"github.com/pion/ice/v3"
+	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/report"
 	"github.com/pion/webrtc/v4"
@@ -38,7 +38,7 @@ func NewApiFactory(conf config.Webrtc, log *logger.Logger, mod ModApiFun) (api *
 	}
 	customLogger := NewPionLogger(log, conf.LogLevel)
 	s := webrtc.SettingEngine{LoggerFactory: customLogger}
-	s.SetIncludeLoopbackCandidate(true)
+	s.SetIncludeLoopbackCandidate(conf.IncludeLoopbackCandidate)
 	if conf.HasDtlsRole() {
 		log.Info().Msgf("A custom DTLS role [%v]", conf.DtlsRole)
 		err = s.SetAnsweringDTLSRole(webrtc.DTLSRole(conf.DtlsRole))
@@ -75,6 +75,17 @@ func NewApiFactory(conf config.Webrtc, log *logger.Logger, mod ModApiFun) (api *
 
 	s.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	s.EnableSCTPZeroChecksum(true)
+	s.EnableSctpSnap(true)
+	if len(conf.IpFilter) > 0 {
+		s.SetIPFilter(func(i net.IP) (keep bool) {
+			return filterIP(i, conf.IpFilter)
+		})
+	}
+	if len(conf.IpFilterRemote) > 0 {
+		s.SetRemoteIPFilter(func(i net.IP) (keep bool) {
+			return filterIP(i, conf.IpFilterRemote)
+		})
+	}
 
 	if mod != nil {
 		mod(m, i, &s)
@@ -97,4 +108,19 @@ func NewApiFactory(conf config.Webrtc, log *logger.Logger, mod ModApiFun) (api *
 
 func (a *ApiFactory) NewPeer() (*webrtc.PeerConnection, error) {
 	return a.api.NewPeerConnection(a.conf)
+}
+
+func filterIP(i net.IP, filter []string) bool {
+	for _, ip := range filter {
+		if i.String() == ip {
+			return false
+		}
+		if ip == "local" && i.IsLoopback() {
+			return false
+		}
+		if ip == "private" && i.IsPrivate() {
+			return false
+		}
+	}
+	return true
 }

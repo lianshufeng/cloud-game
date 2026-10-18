@@ -28,6 +28,10 @@ func CheckCreateDir(path string) error {
 	return nil
 }
 
+func MakeDirAll(path string) error {
+	return os.MkdirAll(path, os.ModeDir|os.ModePerm)
+}
+
 func ExpectTermination() chan struct{} {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
@@ -45,6 +49,37 @@ func GetUserHome() (string, error) {
 		return "", err
 	}
 	return me.HomeDir, nil
+}
+
+func CopyFile(from string, to string) (err error) {
+	f, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err2 := f.Close(); err2 != nil {
+			err = errors.Join(err, err2)
+		}
+	}()
+
+	destFile, err := os.Create(to)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err2 := destFile.Close(); err != nil {
+			err = errors.Join(err, err2)
+		}
+	}()
+
+	n, err := f.WriteTo(destFile)
+	if n == 0 {
+		return errors.New("nothing was written")
+	}
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func WriteFile(name string, data []byte, perm os.FileMode) error {
@@ -83,4 +118,8 @@ func StatSize(path string) (int64, error) {
 		return 0, err
 	}
 	return fi.Size(), nil
+}
+
+func RemoveAll(path string) error {
+	return os.RemoveAll(path)
 }

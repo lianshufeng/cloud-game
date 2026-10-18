@@ -29,4 +29,13 @@ export const KEY = {
     L3: 'l3',
     R3: 'r3',
     REC: 'rec',
-}
+    RESET: 'reset',
+};
+
+// Keys match libretro RETRO_DEVICE_ID_JOYPAD_*
+export const JOYPAD_KEYS = [
+    KEY.B, KEY.Y, KEY.SELECT, KEY.START,
+    KEY.UP, KEY.DOWN, KEY.LEFT, KEY.RIGHT,
+    KEY.A, KEY.X, KEY.L, KEY.R,
+    KEY.L2, KEY.R2, KEY.L3, KEY.R3
+]
